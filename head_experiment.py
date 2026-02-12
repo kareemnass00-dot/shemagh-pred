@@ -8,14 +8,19 @@ Experiments:
   - Augmentation: heavy (handles B&W, color filters, side angles)
   - Plus: grayscale copies variant
 """
-import os, sys, shutil, csv, time
+import os, sys, shutil, csv, time, argparse
 from pathlib import Path
+
+parser = argparse.ArgumentParser(description='Head Detection Experiment Grid')
+parser.add_argument('--epochs', type=int, default=100, help='Training epochs (default: 100)')
+parser.add_argument('--patience', type=int, default=30, help='Early stopping patience (default: 30)')
+args = parser.parse_args()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Config
 # ══════════════════════════════════════════════════════════════════════════════
-EPOCHS = 100
-PATIENCE = 30
+EPOCHS = args.epochs
+PATIENCE = args.patience
 
 # Auto-detect data path (same logic as dual_specialist.py)
 POSSIBLE_PATHS = [
