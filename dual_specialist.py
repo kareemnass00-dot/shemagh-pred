@@ -17,18 +17,33 @@ from ultralytics import YOLO
 import yaml
 
 # Configuration
-# Path Fix for Kaggle nested structure
-if os.path.exists("./data/dal-shemagh-detection-challenge"):
-    ROOT_DIR = "./data/dal-shemagh-detection-challenge"
-else:
-    ROOT_DIR = "./data"  # Fallback
+# Robust Path Detection
+POSSIBLE_PATHS = [
+    "/kaggle/input/dal-shemagh-identification",  # Standard Kaggle
+    "/kaggle/input/dal-shemagh-detection-challenge", # Alternate Kaggle
+    "./data/dal-shemagh-detection-challenge",    # Local Nested
+    "./data",                                    # Local Flat
+    "../input/dal-shemagh-identification"        # Relative Parent
+]
+
+ROOT_DIR = None
+for p in POSSIBLE_PATHS:
+    if os.path.exists(p) and os.path.exists(f"{p}/images/train"):
+        ROOT_DIR = p
+        break
+
+if ROOT_DIR is None:
+    print(f"ERROR: Could not find dataset in {POSSIBLE_PATHS}")
+    print("Files in current dir:", os.listdir("."))
+    if os.path.exists("./data"): print("Files in ./data:", os.listdir("./data"))
+    exit(1)
     
 WORK_DIR = "."
 
 # Update Ultralytics for H100
 os.system('pip install -U ultralytics')
 
-# Data Prep (Using local ./data)
+# Data Prep
 train_csv_path = f"{ROOT_DIR}/train.csv"
 train_dir = f"{ROOT_DIR}/images/train"
 test_dir = f"{ROOT_DIR}/images/test"
