@@ -50,17 +50,6 @@ RESULTS_FILE = "shemagh_experiment_results.csv"
 # Experiment Configs
 # ══════════════════════════════════════════════════════════════════════════════
 EXPERIMENTS = [
-    # (name, model, imgsz, batch, extra_aug_kwargs)
-    ("s_640",   "yolov8s.pt", 640,  32, {}),
-    ("s_960",   "yolov8s.pt", 960,  16, {}),
-    ("m_640",   "yolov8m.pt", 640,  32, {}),
-    ("m_960",   "yolov8m.pt", 960,  16, {}),
-    ("m_1280",  "yolov8m.pt", 1280, 8,  {}),
-    ("l_640",   "yolov8l.pt", 640,  16, {}),
-    ("l_960",   "yolov8l.pt", 960,  8,  {}),
-    ("l_1280",  "yolov8l.pt", 1280, 4,  {}),
-    # Grayscale copies variant
-    ("m_640_gray", "yolov8m.pt", 640, 32, {"grayscale": True}),
     ("s_640_gray", "yolov8s.pt", 640, 32, {"grayscale": True}),
 ]
 
