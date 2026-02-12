@@ -237,17 +237,21 @@ def evaluate_head_detection(model, test_dir, gt, imgsz, conf_thresholds=[0.1, 0.
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. Main — Run All Experiments
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Upgrade ultralytics first
+os.system('pip install -U ultralytics')
+
 def main():
     from ultralytics import YOLO
+    import glob
     
-    # Detect test image directory
-    if os.path.exists("/kaggle/input"):
-        test_dir = f"{ROOT_DIR}/images/test"
-    else:
-        test_dir = f"{ROOT_DIR}/images/test"
+    test_dir = f"{ROOT_DIR}/images/test"
     
     gt = load_ground_truth()
     print(f"Ground truth: {sum(gt.values())} heads out of {len(gt)} images")
+    print(f"Data root: {ROOT_DIR}")
+    print(f"Test dir: {test_dir} ({len(os.listdir(test_dir))} files)")
+    print(f"Labels file: {LABELS_FILE}")
     print(f"Running {len(EXPERIMENTS)} experiments...\n")
     
     results = []
@@ -266,7 +270,7 @@ def main():
         
         # Train
         model = YOLO(model_name)
-        model.train(
+        train_results = model.train(
             data=data_yaml,
             epochs=EPOCHS,
             imgsz=imgsz,
@@ -274,18 +278,39 @@ def main():
             project='./head_experiments',
             name=exp_name,
             patience=PATIENCE,
+            exist_ok=True,
             **COMMON_AUG
         )
         
-        # Load best weights
-        best_weights = f"./head_experiments/{exp_name}/weights/best.pt"
+        # Get best weights — multiple strategies, guaranteed to find it
+        best_weights = str(model.trainer.best)
+        print(f"  Trainer reports best at: {best_weights}")
+        
         if not os.path.exists(best_weights):
-            # Try with suffix
-            for suffix in ['', '2', '3', '4', '5']:
-                path = f"./head_experiments/{exp_name}{suffix}/weights/best.pt"
-                if os.path.exists(path):
-                    best_weights = path
+            # Strategy 2: search common locations
+            search_paths = [
+                f"./head_experiments/{exp_name}/weights/best.pt",
+                f"./runs/detect/head_experiments/{exp_name}/weights/best.pt",
+                f"./runs/head_experiments/{exp_name}/weights/best.pt",
+            ]
+            for sp in search_paths:
+                if os.path.exists(sp):
+                    best_weights = sp
+                    print(f"  Found at alternate path: {best_weights}")
                     break
+        
+        if not os.path.exists(best_weights):
+            # Strategy 3: brute force find
+            import subprocess
+            result = subprocess.run(['find', '.', '-path', f'*{exp_name}*best.pt'], 
+                                    capture_output=True, text=True)
+            found = [p.strip() for p in result.stdout.strip().split('\n') if p.strip()]
+            if found:
+                best_weights = found[0]
+                print(f"  Found via search: {best_weights}")
+        
+        assert os.path.exists(best_weights), \
+            f"FATAL: best.pt not found for {exp_name}. Trainer said: {model.trainer.best}"
         
         model_best = YOLO(best_weights)
         
@@ -313,10 +338,11 @@ def main():
             'recall': stats['recall'],
             'f1': stats['f1'],
             'accuracy': stats['accuracy'],
-            'time_s': int(elapsed)
+            'time_s': int(elapsed),
+            'weights_path': best_weights
         })
         
-        # Save results incrementally
+        # Save results incrementally (after every experiment, even failed ones)
         with open(RESULTS_FILE, 'w') as f:
             f.write('name,model,imgsz,batch,best_thresh,tp,fp,fn,tn,precision,recall,f1,accuracy,time_s\n')
             for r in results:
@@ -333,7 +359,7 @@ def main():
     
     results.sort(key=lambda x: x['f1'], reverse=True)
     for r in results:
-        marker = " ★" if r['f1'] == results[0]['f1'] else ""
+        marker = " ★" if r == results[0] else ""
         print(f"{r['name']:<14} {r['model']:<12} {r['imgsz']:<6} {r['best_thresh']:<7} "
               f"{r['tp']:>4} {r['fp']:>4} {r['fn']:>4} "
               f"{r['precision']:>6.3f} {r['recall']:>6.3f} {r['f1']:>6.3f} {r['accuracy']:>6.3f} {r['time_s']:>4}s{marker}")
