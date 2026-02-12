@@ -17,13 +17,26 @@ from pathlib import Path
 EPOCHS = 100
 PATIENCE = 30
 
-# Auto-detect paths (Kaggle vs local)
-if os.path.exists("/kaggle/input"):
-    ROOT_DIR = "/kaggle/input/dal-shemagh-detection-challenge"
-    LABELS_FILE = "/kaggle/working/shemagh-pred/labels.txt"
-else:
-    ROOT_DIR = "data/dal-shemagh-detection-challenge"
-    LABELS_FILE = "labels.txt"
+# Auto-detect data path (same logic as dual_specialist.py)
+POSSIBLE_PATHS = [
+    "./data/dal-shemagh-detection-challenge",
+    "./data",
+    "../input/dal-shemagh-detection-challenge",
+    "../input/dal-shemagh-identification"
+]
+ROOT_DIR = None
+for p in POSSIBLE_PATHS:
+    if os.path.exists(p) and os.path.exists(f"{p}/images/train"):
+        ROOT_DIR = p
+        break
+if ROOT_DIR is None:
+    print(f"ERROR: Could not find dataset in {POSSIBLE_PATHS}")
+    print("Files in current dir:", os.listdir("."))
+    if os.path.exists("./data"): print("Files in ./data:", os.listdir("./data"))
+    sys.exit(1)
+
+# Labels file (same directory as this script)
+LABELS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "labels.txt")
 
 WORK_DIR = "./yolo_head_exp"
 RESULTS_FILE = "head_experiment_results.csv"
