@@ -50,8 +50,8 @@ test_dir = f"{ROOT_DIR}/images/test"
 
 print(f"Using Data at: {ROOT_DIR}")
 
-# H100 Settings
-BATCH_SIZE = 32
+# H100 Settings (Adjusted for OOM)
+BATCH_SIZE = 8
 EPOCHS = 100
 IMGSZ = 1280
 WORK_DIR_HEAD = "./yolo_head"
