@@ -6,12 +6,11 @@ DAL-Shemagh v12 — Dual Specialist Models (Optimized)
 # Head:    yolov8m @ 640px  → F1=0.969 on ground truth
 # Shemagh: yolov8m @ 640px + grayscale copies → F1=0.948
 # right_place: all-pairs overlap check (threshold 0.10)
+#
+# Mode: Uses pre-trained weights from models/ folder (no training needed)
 """
 import os
-import random
-import shutil
-import cv2
-from pathlib import Path
+import sys
 from ultralytics import YOLO
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -27,7 +26,7 @@ POSSIBLE_PATHS = [
 
 ROOT_DIR = None
 for p in POSSIBLE_PATHS:
-    if os.path.exists(p) and os.path.exists(f"{p}/images/train"):
+    if os.path.exists(p) and os.path.exists(f"{p}/images/test"):
         ROOT_DIR = p
         break
 
@@ -35,211 +34,49 @@ if ROOT_DIR is None:
     print(f"ERROR: Could not find dataset in {POSSIBLE_PATHS}")
     print("Files in current dir:", os.listdir("."))
     if os.path.exists("./data"): print("Files in ./data:", os.listdir("./data"))
-    exit(1)
+    sys.exit(1)
 
 os.system('pip install -U ultralytics')
 
 print(f"Using Data at: {ROOT_DIR}")
 
-# Experiment-proven optimal settings
-SEED = 42
-VAL_RATIO = 0.2
-EPOCHS = 100
-PATIENCE = 30
+# Model paths (relative to script location)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+HEAD_WEIGHTS = os.path.join(SCRIPT_DIR, "models", "head_m640_best.pt")
+SHEMAGH_WEIGHTS = os.path.join(SCRIPT_DIR, "models", "shemagh_m640_best.pt")
 
-# Head: yolov8m @ 640 (F1=0.969)
-HEAD_MODEL = "yolov8m.pt"
+# Inference settings (must match training)
 HEAD_IMGSZ = 640
-HEAD_BATCH = 32
-
-# Shemagh: yolov8m @ 640 + grayscale (F1=0.948)
-SHEMAGH_MODEL = "yolov8m.pt"
 SHEMAGH_IMGSZ = 640
-SHEMAGH_BATCH = 32
-
-# Heavy augmentation (proven in experiments)
-COMMON_AUG = dict(
-    hsv_h=0.5,
-    hsv_s=0.9,
-    hsv_v=0.5,
-    degrees=30.0,
-    translate=0.2,
-    scale=0.5,
-    fliplr=0.5,
-    mosaic=1.0,
-    mixup=0.3,
-    erasing=0.3,
-    copy_paste=0.1,
-)
 
 # Right-place overlap threshold
 OVERLAP_THRESHOLD = 0.10
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. Prepare Split Datasets
-# ══════════════════════════════════════════════════════════════════════════════
-def prepare_specialist_data(class_id, work_dir, include_grayscale=False):
-    """Prepare single-class YOLO training data with optional grayscale copies."""
-    class_name = 'Head' if class_id == 0 else 'Shemagh'
-    print(f"\nPreparing dataset for {class_name} (class {class_id}) in {work_dir}...")
-
-    work_dir_path = Path(work_dir)
-    for sub in ("images", "labels"):
-        existing = work_dir_path / sub
-        if existing.exists():
-            shutil.rmtree(existing)
-
-    for split in ("train", "val"):
-        (work_dir_path / "images" / split).mkdir(parents=True, exist_ok=True)
-        (work_dir_path / "labels" / split).mkdir(parents=True, exist_ok=True)
-
-    root_images = Path(ROOT_DIR) / "images" / "train"
-    root_labels = Path(ROOT_DIR) / "labels" / "train"
-    all_files = sorted([p.name for p in root_images.iterdir() if p.suffix.lower() == ".jpg"])
-
-    # Stratified split
-    positive_files = []
-    negative_files = []
-    for fname in all_files:
-        src_lbl = root_labels / f"{Path(fname).stem}.txt"
-        has_class = False
-        if src_lbl.exists():
-            for line in src_lbl.read_text().splitlines():
-                parts = line.split()
-                if not parts:
-                    continue
-                try:
-                    if int(parts[0]) == class_id:
-                        has_class = True
-                        break
-                except ValueError:
-                    continue
-        (positive_files if has_class else negative_files).append(fname)
-
-    rng = random.Random(SEED)
-    rng.shuffle(positive_files)
-    rng.shuffle(negative_files)
-
-    # Include ~50% negatives for better precision
-    neg_sample = negative_files[:len(positive_files) // 2]
-
-    all_train_files = positive_files + neg_sample
-    rng.shuffle(all_train_files)
-
-    n_val = int(len(all_train_files) * VAL_RATIO)
-    val_files = all_train_files[:n_val]
-    train_files = all_train_files[n_val:]
-
-    stats = {"train": 0, "val": 0, "train_instances": 0, "val_instances": 0}
-    
-    for split, files in [("train", train_files), ("val", val_files)]:
-        for fname in files:
-            # Copy image
-            shutil.copy2(root_images / fname, work_dir_path / "images" / split / fname)
-            
-            # Filter label (remap class_id → 0)
-            lbl_name = f"{Path(fname).stem}.txt"
-            src_lbl = root_labels / lbl_name
-            dst_lbl = work_dir_path / "labels" / split / lbl_name
-            
-            if src_lbl.exists():
-                with open(src_lbl, "r") as f_in, open(dst_lbl, "w") as f_out:
-                    for line in f_in:
-                        parts = line.split()
-                        if len(parts) == 5:
-                            try:
-                                if int(parts[0]) == class_id:
-                                    f_out.write(f"0 {parts[1]} {parts[2]} {parts[3]} {parts[4]}\n")
-                                    stats[f"{split}_instances"] += 1
-                            except ValueError:
-                                continue
-            else:
-                open(dst_lbl, "w").close()
-            
-            # Add grayscale copy for training set
-            if include_grayscale and split == "train":
-                gray_name = fname.replace('.jpg', '_gray.jpg')
-                img = cv2.imread(str(root_images / fname))
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                cv2.imwrite(str(work_dir_path / "images" / split / gray_name), gray_bgr)
-                # Copy same label
-                gray_lbl = lbl_name.replace('.txt', '_gray.txt')
-                shutil.copy2(dst_lbl, work_dir_path / "labels" / split / gray_lbl)
-            
-            stats[split] += 1
-
-    yaml_content = f"""path: {os.path.abspath(work_dir)}
-train: images/train
-val: images/val
-nc: 1
-names: ['{class_name}']
-"""
-    with open(f"{work_dir}/data.yaml", 'w') as f:
-        f.write(yaml_content)
-
-    print(f"  {class_name}: {stats['train']} train ({stats['train_instances']} instances), "
-          f"{stats['val']} val ({stats['val_instances']} instances)"
-          + (" (+grayscale copies)" if include_grayscale else ""))
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 2. Prepare Data
-# ══════════════════════════════════════════════════════════════════════════════
-WORK_DIR_HEAD = "./yolo_head"
-WORK_DIR_SHEMAGH = "./yolo_shemagh"
-
-prepare_specialist_data(0, WORK_DIR_HEAD, include_grayscale=False)
-prepare_specialist_data(1, WORK_DIR_SHEMAGH, include_grayscale=True)  # Grayscale copies for shemagh
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 3. Train Two Models
+# 1. Load Pre-trained Models
 # ══════════════════════════════════════════════════════════════════════════════
 print("\n" + "="*60)
-print(f"  TRAINING HEAD MODEL — {HEAD_MODEL} @ {HEAD_IMGSZ}px")
+print("  LOADING PRE-TRAINED MODELS")
 print("="*60)
-model_head = YOLO(HEAD_MODEL)
-model_head.train(
-    data=f"{WORK_DIR_HEAD}/data.yaml",
-    epochs=EPOCHS, imgsz=HEAD_IMGSZ, batch=HEAD_BATCH,
-    project='./models', name='head_model',
-    patience=PATIENCE, exist_ok=True,
-    **COMMON_AUG
-)
 
-# Get best weights
-best_head = str(model_head.trainer.best)
-print(f"  Head best weights: {best_head}")
-assert os.path.exists(best_head), f"Head weights not found: {best_head}"
+assert os.path.exists(HEAD_WEIGHTS), f"Head weights not found: {HEAD_WEIGHTS}"
+assert os.path.exists(SHEMAGH_WEIGHTS), f"Shemagh weights not found: {SHEMAGH_WEIGHTS}"
 
-print("\n" + "="*60)
-print(f"  TRAINING SHEMAGH MODEL — {SHEMAGH_MODEL} @ {SHEMAGH_IMGSZ}px + grayscale")
-print("="*60)
-model_shemagh = YOLO(SHEMAGH_MODEL)
-model_shemagh.train(
-    data=f"{WORK_DIR_SHEMAGH}/data.yaml",
-    epochs=EPOCHS, imgsz=SHEMAGH_IMGSZ, batch=SHEMAGH_BATCH,
-    project='./models', name='shemagh_model',
-    patience=PATIENCE, exist_ok=True,
-    **COMMON_AUG
-)
+model_head = YOLO(HEAD_WEIGHTS)
+print(f"  Head model loaded: {HEAD_WEIGHTS}")
 
-best_shemagh = str(model_shemagh.trainer.best)
-print(f"  Shemagh best weights: {best_shemagh}")
-assert os.path.exists(best_shemagh), f"Shemagh weights not found: {best_shemagh}"
-
-# Load best weights for inference
-model_head = YOLO(best_head)
-model_shemagh = YOLO(best_shemagh)
+model_shemagh = YOLO(SHEMAGH_WEIGHTS)
+print(f"  Shemagh model loaded: {SHEMAGH_WEIGHTS}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4. Inference & Logic
+# 2. Inference & Logic
 # ══════════════════════════════════════════════════════════════════════════════
 print("\n" + "="*60)
 print("  DUAL MODEL INFERENCE")
 print("="*60)
 
 def get_overlap(box_a, box_b):
-    """Calculate IoU-style overlap between two xywh normalized boxes.
+    """Calculate overlap between two xywh normalized boxes.
     Returns intersection / area of smaller box (containment ratio)."""
     ax, ay, aw, ah = box_a
     bx, by, bw, bh = box_b
@@ -310,7 +147,7 @@ for fname in test_files:
     submission.append([fname, rp, pred_str])
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5. Save Submission
+# 3. Save Submission
 # ══════════════════════════════════════════════════════════════════════════════
 right_place_count = sum([x[1] for x in submission])
 print(f"\nDone! right_place=1: {right_place_count}/{total}")
