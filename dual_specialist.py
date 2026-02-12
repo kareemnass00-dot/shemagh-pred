@@ -257,13 +257,11 @@ for fname in test_files:
         best_h = heads[0]      # Highest confidence head
         best_s = shemaghs[0]   # Highest confidence shemagh
         
-        # Only consider valid top candidates (> 0.25)
-        if best_h[4] > 0.25 and best_s[4] > 0.25:
-            # Check containment (Strict > 20%)
-            h_box = best_h[:4]
-            s_box = best_s[:4]
-            if get_containment(h_box, s_box) > 0.20:
-                rp = 1
+        # No threshold — if it was detected, use it
+        h_box = best_h[:4]
+        s_box = best_s[:4]
+        if get_containment(h_box, s_box) > 0.20:
+            rp = 1
 
     # 2. Prediction String for mAP Score
     # Report ALL boxes (down to 0.01) to maximize Recall
