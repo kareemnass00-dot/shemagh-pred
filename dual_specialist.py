@@ -11,10 +11,10 @@ Idea: Train two separate models to avoid confusion and NMS issues.
 Start small with yolov8n to test the concept quickly.
 """
 import os
+import random
 import shutil
-import pandas as pd
+from pathlib import Path
 from ultralytics import YOLO
-import yaml
 
 # Configuration
 # Robust Path Detection
@@ -56,54 +56,107 @@ EPOCHS = 100
 IMGSZ = 1280
 WORK_DIR_HEAD = "./yolo_head"
 WORK_DIR_SHEMAGH = "./yolo_shemagh"
+SEED = int(os.getenv("SEED", "42"))
+VAL_RATIO = float(os.getenv("VAL_RATIO", "0.2"))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Prepare Split Datasets (Head-only / Shemagh-only)
 # ══════════════════════════════════════════════════════════════════════════════
-def prepare_specialist_data(class_id, work_dir):
+def prepare_specialist_data(class_id, work_dir, *, val_ratio=VAL_RATIO, seed=SEED):
     print(f"\nPreparing dataset for Class {class_id} in {work_dir}...")
-    
-    # Create dirs
-    for split in ['train', 'val']:
-        os.makedirs(f"{work_dir}/images/{split}", exist_ok=True)
-        os.makedirs(f"{work_dir}/labels/{split}", exist_ok=True)
 
-    # We use the full training set for training (no split script here for brevity, 
-    # but in real run we'd split. For now, let's just use all for max performance)
-    # Actually, let's do a simple 80/20 split on file list
-    all_files = sorted([f for f in os.listdir(f"{ROOT_DIR}/images/train") if f.endswith('.jpg')])
-    split_idx = int(len(all_files) * 0.8)
-    train_files = all_files[:split_idx]
-    val_files = all_files[split_idx:]
+    if not (0.0 < val_ratio < 1.0):
+        raise ValueError(f"val_ratio must be between 0 and 1 (got {val_ratio})")
+
+    work_dir_path = Path(work_dir)
+    for sub in ("images", "labels"):
+        existing = work_dir_path / sub
+        if existing.exists():
+            shutil.rmtree(existing)
+
+    # Create dirs
+    for split in ("train", "val"):
+        (work_dir_path / "images" / split).mkdir(parents=True, exist_ok=True)
+        (work_dir_path / "labels" / split).mkdir(parents=True, exist_ok=True)
+
+    # Stratified split: ensure both splits contain examples of the target class (if any exist).
+    root_images = Path(ROOT_DIR) / "images" / "train"
+    root_labels = Path(ROOT_DIR) / "labels" / "train"
+    all_files = sorted([p.name for p in root_images.iterdir() if p.suffix.lower() == ".jpg"])
+
+    positive_files = []
+    negative_files = []
+    for fname in all_files:
+        src_lbl = root_labels / f"{Path(fname).stem}.txt"
+        has_class = False
+        if src_lbl.exists():
+            for line in src_lbl.read_text().splitlines():
+                parts = line.split()
+                if not parts:
+                    continue
+                try:
+                    if int(parts[0]) == class_id:
+                        has_class = True
+                        break
+                except ValueError:
+                    continue
+        (positive_files if has_class else negative_files).append(fname)
+
+    rng = random.Random(seed)
+    rng.shuffle(positive_files)
+    rng.shuffle(negative_files)
+
+    n_val_pos = int(round(len(positive_files) * val_ratio))
+    if positive_files and n_val_pos == 0:
+        n_val_pos = 1
+    n_val_neg = int(round(len(negative_files) * val_ratio))
+
+    val_files = positive_files[:n_val_pos] + negative_files[:n_val_neg]
+    train_files = positive_files[n_val_pos:] + negative_files[n_val_neg:]
+    rng.shuffle(train_files)
+    rng.shuffle(val_files)
     
     # Process files
-    for split, files in [('train', train_files), ('val', val_files)]:
+    stats = {
+        "train": {"images": len(train_files), "images_with_obj": 0, "instances": 0},
+        "val": {"images": len(val_files), "images_with_obj": 0, "instances": 0},
+    }
+    for split, files in [("train", train_files), ("val", val_files)]:
         for fname in files:
             # Copy Image
-            shutil.copy(f"{ROOT_DIR}/images/train/{fname}", f"{work_dir}/images/{split}/{fname}")
+            shutil.copy2(root_images / fname, work_dir_path / "images" / split / fname)
             
             # Filter Label
-            lbl_name = fname.replace('.jpg', '.txt')
-            src_lbl = f"{ROOT_DIR}/labels/train/{lbl_name}"
-            dst_lbl = f"{work_dir}/labels/{split}/{lbl_name}"
+            lbl_name = f"{Path(fname).stem}.txt"
+            src_lbl = root_labels / lbl_name
+            dst_lbl = work_dir_path / "labels" / split / lbl_name
             
             if os.path.exists(src_lbl):
-                with open(src_lbl, 'r') as f_in, open(dst_lbl, 'w') as f_out:
-                    lines = f_in.readlines()
-                    has_obj = False
-                    for line in lines:
+                has_obj = False
+                with open(src_lbl, "r") as f_in, open(dst_lbl, "w") as f_out:
+                    for line in f_in:
                         parts = line.split()
-                        if int(parts[0]) == class_id:
-                            # Remap class to 0 (since it's a single-class model)
-                            # Actually, keep original class ID to avoid confusion later?
-                            # YOLO expects 0-indexed for single class usually. 
-                            # Let's map everything to class 0 for the model, then remap back at inference.
+                        if len(parts) != 5:
+                            continue
+                        try:
+                            src_class_id = int(parts[0])
+                        except ValueError:
+                            continue
+                        if src_class_id == class_id:
+                            # Remap class to 0 (single-class model), remap back at inference.
                             f_out.write(f"0 {parts[1]} {parts[2]} {parts[3]} {parts[4]}\n")
+                            stats[split]["instances"] += 1
                             has_obj = True
-                    if not has_obj:
-                        pass # Empty file created automatically by open/close? No, 'w' creates it.
+                if has_obj:
+                    stats[split]["images_with_obj"] += 1
             else:
-                open(dst_lbl, 'w').close() # Empty
+                open(dst_lbl, "w").close()  # Empty
+
+    print(
+        f"Class {class_id} split stats | "
+        f"train: {stats['train']['images']} imgs, {stats['train']['images_with_obj']} with obj, {stats['train']['instances']} instances | "
+        f"val: {stats['val']['images']} imgs, {stats['val']['images_with_obj']} with obj, {stats['val']['instances']} instances"
+    )
     
     # Config YAML
     yaml_content = f"""path: {os.path.abspath(work_dir)}
@@ -132,12 +185,15 @@ model_head.train(data=f"{WORK_DIR_HEAD}/data.yaml", epochs=EPOCHS, imgsz=IMGSZ, 
                  hsv_h=0.3, hsv_s=0.7, hsv_v=0.4, degrees=10.0, fliplr=0.5, patience=50)
 
 print("\n" + "="*60)
-print("  TRAINING SHEMAGH MODEL (Class 1)")
+print("  TRAINING SHEMAGH MODEL (Class 1) — Medium Model @ 640px")
 print("="*60)
-model_shemagh = YOLO('yolov8x.pt')
-model_shemagh.train(data=f"{WORK_DIR_SHEMAGH}/data.yaml", epochs=EPOCHS, imgsz=IMGSZ, batch=BATCH_SIZE,
+# Shemagh has far fewer instances (~100 train) so yolov8x overfits badly
+# Use yolov8m (medium) at 640px with extra augmentation for better generalization
+model_shemagh = YOLO('yolov8m.pt')
+model_shemagh.train(data=f"{WORK_DIR_SHEMAGH}/data.yaml", epochs=EPOCHS, imgsz=640, batch=16,
                     project='./models', name='shemagh_model',
-                    hsv_h=0.3, hsv_s=0.7, hsv_v=0.4, degrees=10.0, fliplr=0.5, patience=50)
+                    hsv_h=0.3, hsv_s=0.7, hsv_v=0.4, degrees=15.0, fliplr=0.5,
+                    mosaic=1.0, mixup=0.3, copy_paste=0.1, patience=50)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. Inference & Logic
@@ -184,8 +240,8 @@ for fname in test_files:
     for box in res_h.boxes:
         heads.append(box.xywhn[0].tolist() + [float(box.conf[0])]) # x,y,w,h,conf
 
-    # Predict Shemagh (Balanced Confidence, TTA Enabled)
-    res_s = model_shemagh.predict(img_path, conf=0.15, imgsz=IMGSZ, augment=True, verbose=False)[0]
+    # Predict Shemagh (Medium Model @ 640px, TTA Enabled)
+    res_s = model_shemagh.predict(img_path, conf=0.15, imgsz=640, augment=True, verbose=False)[0]
     shemaghs = []
     for box in res_s.boxes:
         shemaghs.append(box.xywhn[0].tolist() + [float(box.conf[0])])
