@@ -186,7 +186,7 @@ def load_ground_truth():
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. Evaluate Head Detection
 # ══════════════════════════════════════════════════════════════════════════════
-def evaluate_head_detection(model, test_dir, gt, imgsz, conf_thresholds=[0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5]):
+def evaluate_head_detection(model, test_dir, gt, imgsz, conf_thresholds=[0.01, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5]):
     """Run inference on test images and evaluate against ground truth."""
     
     test_images = sorted([f for f in os.listdir(test_dir) if f.endswith('.jpg')],
@@ -198,7 +198,7 @@ def evaluate_head_detection(model, test_dir, gt, imgsz, conf_thresholds=[0.1, 0.
     
     for img_file in test_images:
         img_path = os.path.join(test_dir, img_file)
-        results = model.predict(img_path, conf=0.05, imgsz=imgsz, verbose=False)[0]
+        results = model.predict(img_path, conf=0.01, imgsz=imgsz, verbose=False)[0]
         
         max_conf = 0
         for box in results.boxes:
@@ -209,8 +209,7 @@ def evaluate_head_detection(model, test_dir, gt, imgsz, conf_thresholds=[0.1, 0.
         detections[img_file] = max_conf
     
     # Evaluate at multiple confidence thresholds
-    best_f1 = 0
-    best_thresh = 0
+    best_f1 = -1
     best_stats = None
     
     for thresh in conf_thresholds:
@@ -230,13 +229,14 @@ def evaluate_head_detection(model, test_dir, gt, imgsz, conf_thresholds=[0.1, 0.
         
         if f1 > best_f1:
             best_f1 = f1
-            best_thresh = thresh
             best_stats = {
                 'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn,
                 'precision': precision, 'recall': recall, 'f1': f1,
                 'accuracy': accuracy, 'thresh': thresh
             }
     
+    # Guaranteed non-None (best_f1 starts at -1, so even F1=0 gets stored)
+    assert best_stats is not None, "No thresholds evaluated"
     return best_stats, detections
 
 # ══════════════════════════════════════════════════════════════════════════════
