@@ -61,6 +61,7 @@ EXPERIMENTS = [
     ("l_1280",  "yolov8l.pt", 1280, 4,  {}),
     # Grayscale copies variant
     ("m_640_gray", "yolov8m.pt", 640, 32, {"grayscale": True}),
+    ("s_640_gray", "yolov8s.pt", 640, 32, {"grayscale": True}),
 ]
 
 # Common heavy augmentation (handles B&W, color filters, side angles)
