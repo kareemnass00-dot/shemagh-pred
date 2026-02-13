@@ -1,9 +1,11 @@
 """
-mAP Experiment v3 — YOLO11 (matching baseline architecture)
+mAP Experiment v3 — YOLO11 + Oversampled Negatives
 # ============================================================
-# Key insight: baseline uses yolo11n with ALL data, light aug, conf=0.25
-# We test: yolo11n, yolo11s, yolo11m at 640px
-# Train on ALL data (val=train) for max data usage
+# Fixes the 73% background FP problem:
+#   1. YOLO11 (newer architecture)
+#   2. Oversample negatives 2x for ~1:1 ratio
+#   3. Light augmentation (no mosaic)
+#   4. conf=0.25 at inference (like baseline)
 # ============================================================
 """
 import os, sys, shutil, random, time, argparse
@@ -30,21 +32,21 @@ for p in POSSIBLE_PATHS:
         ROOT_DIR = p
         break
 if ROOT_DIR is None:
-    print(f"ERROR: Could not find dataset"); sys.exit(1)
+    print("ERROR: Could not find dataset"); sys.exit(1)
 
 WORK_DIR = "./yolo11_map_exp"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Experiments — YOLO11 models
+# Experiments
 # ══════════════════════════════════════════════════════════════════════════════
 EXPERIMENTS = [
     # (name, model, imgsz, batch)
-    ("y11n_640", "yolo11n.pt", 640, 32),   # Baseline model
-    ("y11s_640", "yolo11s.pt", 640, 32),   # One step up
-    ("y11m_640", "yolo11m.pt", 640, 16),   # Medium
+    ("y11n_640", "yolo11n.pt", 640, 32),
+    ("y11s_640", "yolo11s.pt", 640, 32),
+    ("y11m_640", "yolo11m.pt", 640, 16),
 ]
 
-# Light augmentation (matching baseline style)
+# Light augmentation (matching baseline)
 AUG = dict(
     hsv_h=0.015,
     hsv_s=0.1,
@@ -53,7 +55,7 @@ AUG = dict(
     translate=0.1,
     scale=0.1,
     fliplr=0.5,
-    mosaic=0.0,       # No mosaic (baseline doesn't use it)
+    mosaic=0.0,
     mixup=0.0,
     erasing=0.0,
     copy_paste=0.0,
@@ -61,43 +63,72 @@ AUG = dict(
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Prepare Data — ALL data, val=train (like baseline)
+# Prepare Data — ALL images + OVERSAMPLED negatives
 # ══════════════════════════════════════════════════════════════════════════════
 def prepare_data():
-    """Use ALL training data. Val = train (like baseline)."""
-    
+    """
+    - Use all training images
+    - Oversample negatives 2x so model learns "nothing is here"
+    - Current ratio: 448 positive : 203 negative (2.2:1)
+    - After 2x oversample: 448 positive : 406 negative (~1.1:1)
+    """
     work = WORK_DIR
     if os.path.exists(work):
         shutil.rmtree(work)
     
-    # Just symlink to original data
-    os.makedirs(work, exist_ok=True)
+    for sub in ['images/train', 'labels/train']:
+        os.makedirs(f"{work}/{sub}", exist_ok=True)
     
     img_dir = f"{ROOT_DIR}/images/train"
     lbl_dir = f"{ROOT_DIR}/labels/train"
+    all_files = sorted([f for f in os.listdir(img_dir) if f.endswith('.jpg')])
     
-    all_files = [f for f in os.listdir(img_dir) if f.endswith('.jpg')]
+    positives = []
+    negatives = []
     
-    # Count classes
-    head_count = shem_count = both_count = neg_count = 0
     for f in all_files:
-        lbl = f"{lbl_dir}/{f.replace('.jpg', '.txt')}"
-        has_h = has_s = False
-        if os.path.exists(lbl):
-            with open(lbl) as lf:
-                for line in lf:
-                    if line.strip().startswith('0 '): has_h = True
-                    elif line.strip().startswith('1 '): has_s = True
-        if has_h and has_s: both_count += 1
-        elif has_h: head_count += 1
-        elif has_s: shem_count += 1
-        else: neg_count += 1
+        lbl_path = f"{lbl_dir}/{f.replace('.jpg', '.txt')}"
+        has_annotation = False
+        if os.path.exists(lbl_path):
+            content = open(lbl_path).read().strip()
+            if content:
+                has_annotation = True
+        
+        if has_annotation:
+            positives.append(f)
+        else:
+            negatives.append(f)
     
-    print(f"  All data: {len(all_files)} images")
-    print(f"    Both: {both_count}, Head only: {head_count}, Shem only: {shem_count}, Neg: {neg_count}")
+    print(f"  Original: {len(positives)} positive, {len(negatives)} negative")
+    
+    # Copy all positive images + labels
+    for f in positives:
+        shutil.copy(f"{img_dir}/{f}", f"{work}/images/train/{f}")
+        lbl_src = f"{lbl_dir}/{f.replace('.jpg', '.txt')}"
+        lbl_dst = f"{work}/labels/train/{f.replace('.jpg', '.txt')}"
+        shutil.copy(lbl_src, lbl_dst)
+    
+    # Copy all negative images + empty labels
+    for f in negatives:
+        shutil.copy(f"{img_dir}/{f}", f"{work}/images/train/{f}")
+        open(f"{work}/labels/train/{f.replace('.jpg', '.txt')}", 'w').close()
+    
+    # Oversample negatives 2x (copy with suffix)
+    for copy_idx in range(1, 3):  # 2 extra copies
+        for f in negatives:
+            stem = f.replace('.jpg', '')
+            new_name = f"{stem}_neg{copy_idx}.jpg"
+            shutil.copy(f"{img_dir}/{f}", f"{work}/images/train/{new_name}")
+            open(f"{work}/labels/train/{new_name.replace('.jpg', '.txt')}", 'w').close()
+    
+    total_neg = len(negatives) * 3  # original + 2 copies
+    total = len(positives) + total_neg
+    print(f"  After oversample: {len(positives)} positive, {total_neg} negative")
+    print(f"  Ratio: {len(positives)/total_neg:.1f}:1 (pos:neg)")
+    print(f"  Total training images: {total}")
     
     # data.yaml — val=train (like baseline)
-    yaml_content = f"""path: {os.path.abspath(ROOT_DIR)}
+    yaml_content = f"""path: {os.path.abspath(work)}
 train: images/train
 val: images/train
 
@@ -119,15 +150,14 @@ def main():
     from ultralytics import YOLO
     
     print(f"Data root: {ROOT_DIR}")
-    print(f"Epochs: {EPOCHS}")
-    print(f"Running {len(EXPERIMENTS)} YOLO11 experiments...\n")
+    print(f"Epochs: {EPOCHS}\n")
     
     data_yaml = prepare_data()
     results_list = []
     
     for exp_name, model_name, imgsz, batch in EXPERIMENTS:
         print(f"\n{'='*60}")
-        print(f"  YOLO11 EXPERIMENT: {exp_name}")
+        print(f"  EXPERIMENT: {exp_name}")
         print(f"  Model: {model_name} | ImgSz: {imgsz} | Batch: {batch}")
         print(f"{'='*60}")
         
@@ -183,7 +213,7 @@ def main():
     
     # Summary
     print("\n" + "=" * 80)
-    print("  FINAL RESULTS — YOLO11 mAP EXPERIMENTS")
+    print("  FINAL RESULTS — YOLO11 + OVERSAMPLED NEGATIVES")
     print("=" * 80)
     print(f"{'Name':<14} {'Model':<14} {'ImgSz':<6} {'mAP50':>7} {'mAP50-95':>9} {'Head':>7} {'Shem':>7} {'Time':>6}")
     print("-" * 75)
@@ -193,8 +223,6 @@ def main():
         marker = " ★" if r == results_list[0] else ""
         print(f"{r['name']:<14} {r['model']:<14} {r['imgsz']:<6} "
               f"{r['map50']:>7.4f} {r['map50_95']:>9.4f} {r['head_map']:>7.4f} {r['shem_map']:>7.4f} {r['time_s']:>5}s{marker}")
-    
-    print(f"\n🏆 BEST: {results_list[0]['name']} (mAP@50-95={results_list[0]['map50_95']:.4f})")
 
 if __name__ == "__main__":
     main()
