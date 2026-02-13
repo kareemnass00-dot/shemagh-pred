@@ -2,7 +2,11 @@
 mAP-Focused Training — Maximize bounding box quality (mAP@[0.5:0.95])
 # ============================================================
 # Strategy: Single model, both classes, high resolution, large backbone
-# Train for box precision, NOT binary classification
+# - Includes negatives in train+val (empty labels = pure FP detector)
+# - Stratified split (ensures shemagh representation in val)
+# - Close-mosaic for last 10 epochs (tighter boxes)
+# - Low geometric distortion (preserve box alignment)
+# - Per-class mAP reporting
 # ============================================================
 """
 import os, sys, shutil, random, time, argparse
@@ -40,53 +44,47 @@ if ROOT_DIR is None:
 WORK_DIR = "./yolo_map_exp"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Experiment Configs — optimized for mAP (box quality)
+# Experiment Configs
 # ══════════════════════════════════════════════════════════════════════════════
 EXPERIMENTS = [
-    # (name, model, imgsz, batch, aug_dict)
-    # High-res + large models for precise boxes
-    ("x_1280",     "yolov8x.pt",  1280, 4,  "moderate"),
-    ("x_960",      "yolov8x.pt",  960,  8,  "moderate"),
-    ("l_1280",     "yolov8l.pt",  1280, 8,  "moderate"),
-    ("l_960",      "yolov8l.pt",  960,  12, "moderate"),
-    ("m_1280",     "yolov8m.pt",  1280, 12, "moderate"),
-    # Light aug variant — less box distortion
-    ("x_1280_light", "yolov8x.pt", 1280, 4, "light"),
-    # Heavier aug variant
-    ("x_1280_heavy", "yolov8x.pt", 1280, 4, "heavy"),
+    # Top 2 from v1 results
+    ("l_960",        "yolov8l.pt",  960,  12, "moderate"),
+    ("x_1280_light", "yolov8x.pt",  1280, 4,  "light"),
 ]
 
-# Moderate augmentation: enough diversity but doesn't distort boxes
+# Moderate aug: enough diversity, low geometric distortion for tight boxes
 AUG_MODERATE = dict(
     hsv_h=0.3,
     hsv_s=0.5,
     hsv_v=0.3,
-    degrees=10.0,     # Mild rotation (preserve box alignment)
+    degrees=5.0,       # Very mild rotation (tight boxes)
     translate=0.1,
-    scale=0.3,        # Less scale variation
+    scale=0.2,         # Less scale variation
     fliplr=0.5,
     mosaic=1.0,
-    mixup=0.1,        # Very light mixup (preserve box clarity)
-    erasing=0.0,      # NO erasing (preserve full objects for mAP)
+    mixup=0.0,         # No mixup (destroys box edges)
+    erasing=0.0,       # No erasing
     copy_paste=0.1,
+    close_mosaic=10,   # Disable mosaic last 10 epochs for tighter boxes
 )
 
-# Light augmentation: minimal distortion
+# Light aug: minimal distortion, no mosaic at all
 AUG_LIGHT = dict(
     hsv_h=0.015,
-    hsv_s=0.3,
+    hsv_s=0.2,
     hsv_v=0.2,
-    degrees=5.0,
-    translate=0.1,
-    scale=0.2,
+    degrees=0.0,       # No rotation
+    translate=0.05,
+    scale=0.1,
     fliplr=0.5,
-    mosaic=1.0,
+    mosaic=0.0,        # NO mosaic
     mixup=0.0,
     erasing=0.0,
     copy_paste=0.0,
+    close_mosaic=0,
 )
 
-# Heavy augmentation: for comparison
+# Heavy aug: for comparison (we expect this to hurt mAP50-95)
 AUG_HEAVY = dict(
     hsv_h=0.5,
     hsv_s=0.9,
@@ -99,17 +97,20 @@ AUG_HEAVY = dict(
     mixup=0.3,
     erasing=0.3,
     copy_paste=0.1,
+    close_mosaic=10,
 )
 
 AUG_MAP = {"moderate": AUG_MODERATE, "light": AUG_LIGHT, "heavy": AUG_HEAVY}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. Prepare Data — BOTH classes, NO negatives
+# 1. Prepare Data — BOTH classes, WITH negatives, STRATIFIED split
 # ══════════════════════════════════════════════════════════════════════════════
 def prepare_map_data():
-    """Prepare YOLO data with BOTH classes (head=0, shemagh=1).
-    Only includes images that have at least one annotation.
-    No negative examples — we want the model to learn precise boxes."""
+    """Prepare YOLO data with both classes.
+    - Includes ALL images (annotated + negatives with empty labels)
+    - Stratified split: ensures both classes represented in val
+    - Prints per-class counts
+    """
     
     work = WORK_DIR
     if os.path.exists(work):
@@ -123,34 +124,84 @@ def prepare_map_data():
     lbl_dir = f"{ROOT_DIR}/labels/train"
     all_files = sorted([f for f in os.listdir(img_dir) if f.endswith('.jpg')])
     
-    # Only images with annotations (no negatives)
-    annotated_files = []
+    # Categorize images for stratification
+    has_head_only = []      # only head annotations
+    has_shemagh_only = []   # only shemagh annotations
+    has_both = []           # both classes
+    negatives = []          # no annotations
+    
     for f in all_files:
         lbl_path = f"{lbl_dir}/{f.replace('.jpg', '.txt')}"
+        has_head = False
+        has_shem = False
         if os.path.exists(lbl_path):
             with open(lbl_path, 'r') as lf:
-                content = lf.read().strip()
-                if content:  # Has at least one annotation
-                    annotated_files.append(f)
+                for line in lf:
+                    line = line.strip()
+                    if line.startswith('0 '): has_head = True
+                    elif line.startswith('1 '): has_shem = True
+        
+        if has_head and has_shem: has_both.append(f)
+        elif has_head: has_head_only.append(f)
+        elif has_shem: has_shemagh_only.append(f)
+        else: negatives.append(f)
     
+    print(f"  Dataset breakdown:")
+    print(f"    Both classes: {len(has_both)}")
+    print(f"    Head only:    {len(has_head_only)}")
+    print(f"    Shemagh only: {len(has_shemagh_only)}")
+    print(f"    Negatives:    {len(negatives)}")
+    
+    # Stratified 80/20 split per category
     random.seed(42)
-    random.shuffle(annotated_files)
+    train_files = []
+    val_files = []
     
-    # 80/20 split
-    split_idx = int(len(annotated_files) * 0.8)
-    train_files = annotated_files[:split_idx]
-    val_files = annotated_files[split_idx:]
+    for group_name, group in [("both", has_both), ("head_only", has_head_only), 
+                               ("shem_only", has_shemagh_only), ("negatives", negatives)]:
+        random.shuffle(group)
+        n_val = max(1, int(len(group) * 0.2)) if group else 0
+        val_files.extend(group[:n_val])
+        train_files.extend(group[n_val:])
+        print(f"    {group_name}: {len(group) - n_val} train, {n_val} val")
+    
+    random.shuffle(train_files)
+    random.shuffle(val_files)
+    
+    # Copy files
+    head_train = head_val = shem_train = shem_val = 0
     
     for split, files in [('train', train_files), ('val', val_files)]:
         for f in files:
             # Copy image
             shutil.copy(f"{img_dir}/{f}", f"{work}/images/{split}/{f}")
-            # Copy label AS-IS (both classes preserved: 0=head, 1=shemagh)
+            
+            # Copy label or create empty
             lbl_src = f"{lbl_dir}/{f.replace('.jpg', '.txt')}"
             lbl_dst = f"{work}/labels/{split}/{f.replace('.jpg', '.txt')}"
-            shutil.copy(lbl_src, lbl_dst)
+            if os.path.exists(lbl_src):
+                content = open(lbl_src).read().strip()
+                if content:
+                    with open(lbl_dst, 'w') as out:
+                        out.write(content + '\n')
+                    # Count instances
+                    for line in content.split('\n'):
+                        if line.startswith('0 '):
+                            if split == 'train': head_train += 1
+                            else: head_val += 1
+                        elif line.startswith('1 '):
+                            if split == 'train': shem_train += 1
+                            else: shem_val += 1
+                else:
+                    open(lbl_dst, 'w').close()
+            else:
+                open(lbl_dst, 'w').close()  # Empty = negative
     
-    # data.yaml — both classes
+    print(f"\n  Instance counts:")
+    print(f"    Head:    {head_train} train, {head_val} val")
+    print(f"    Shemagh: {shem_train} train, {shem_val} val")
+    
+    # data.yaml
     yaml_content = f"""path: {os.path.abspath(work)}
 train: images/train
 val: images/val
@@ -162,7 +213,7 @@ names:
     with open(f"{work}/data.yaml", 'w') as f:
         f.write(yaml_content)
     
-    print(f"  Data prepared: {len(train_files)} train, {len(val_files)} val (annotated only, no negatives)")
+    print(f"\n  Total: {len(train_files)} train, {len(val_files)} val (including negatives)")
     return f"{work}/data.yaml"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -177,7 +228,7 @@ def main():
     print(f"Epochs: {EPOCHS}, Patience: {PATIENCE}")
     print(f"Running {len(EXPERIMENTS)} mAP experiments...\n")
     
-    # Prepare data once (same for all experiments)
+    # Prepare data once
     data_yaml = prepare_map_data()
     
     results = []
@@ -231,7 +282,7 @@ def main():
         map50_95 = float(val_results.box.map)
         
         # Per-class mAP
-        per_class = val_results.box.maps  # array of per-class mAP50-95
+        per_class = val_results.box.maps
         head_map = float(per_class[0]) if len(per_class) > 0 else 0
         shem_map = float(per_class[1]) if len(per_class) > 1 else 0
         
