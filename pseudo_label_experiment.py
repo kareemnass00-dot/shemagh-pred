@@ -12,9 +12,9 @@ DAL-Shemagh v21 — Pseudo-Labeling (Self-Training)
 import os
 import sys
 import shutil
-import yaml
+import random
+from pathlib import Path
 from ultralytics import YOLO, RTDETR
-from distutils.dir_util import copy_tree
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Config
@@ -22,6 +22,10 @@ from distutils.dir_util import copy_tree
 CONF_THRESHOLD = 0.60  # Only trust high-conf predictions for pseudo-labels
 EPOCHS = 50            # Fine-tune epochs
 IMG_SIZE = 640
+SEED = 42
+VAL_RATIO = 0.20
+INCLUDE_EMPTY_PSEUDO = False  # add empty pseudo labels as negatives
+USE_SYMLINKS = True           # symlink images to save space
 
 # Paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -45,40 +49,114 @@ if ROOT_DIR is None:
     print("ERROR: Dataset not found")
     sys.exit(1)
 
+
+def parse_label_file(label_path: Path) -> tuple[bool, bool]:
+    """Return (has_head, has_shemagh)."""
+    if not label_path.exists():
+        return False, False
+
+    has_head = False
+    has_shemagh = False
+    for line in label_path.read_text().splitlines():
+        parts = line.split()
+        if len(parts) != 5:
+            continue
+        try:
+            class_id = int(parts[0])
+        except ValueError:
+            continue
+        if class_id == 0:
+            has_head = True
+        elif class_id == 1:
+            has_shemagh = True
+    return has_head, has_shemagh
+
+
+def stratified_split(files: list[str], lbl_dir: Path, val_ratio: float, seed: int) -> tuple[list[str], list[str]]:
+    if not (0.0 < val_ratio < 1.0):
+        raise ValueError(f"val_ratio must be between 0 and 1 (got {val_ratio})")
+
+    buckets = {(False, False): [], (True, False): [], (False, True): [], (True, True): []}
+    for fname in files:
+        label_path = lbl_dir / f"{Path(fname).stem}.txt"
+        flags = parse_label_file(label_path)
+        buckets[flags].append(fname)
+
+    rng = random.Random(seed)
+    train, val = [], []
+    for flags, bucket_files in buckets.items():
+        rng.shuffle(bucket_files)
+        n = len(bucket_files)
+        if n == 0:
+            continue
+        n_val = int(round(n * val_ratio))
+        if n_val == 0:
+            n_val = 1
+        if n_val >= n:
+            n_val = n - 1
+        val.extend(bucket_files[:n_val])
+        train.extend(bucket_files[n_val:])
+
+    rng.shuffle(train)
+    rng.shuffle(val)
+    return train, val
+
+
+def link_or_copy(src: Path, dst: Path, use_symlink: bool) -> None:
+    if dst.exists():
+        return
+    if use_symlink:
+        os.symlink(src.resolve(), dst)
+    else:
+        shutil.copy2(src, dst)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Prepare Pseudo-Dataset
 # ══════════════════════════════════════════════════════════════════════════════
 WORK_DIR = "./pseudo_dataset"
 IMG_DIR = f"{WORK_DIR}/images/train"
 LBL_DIR = f"{WORK_DIR}/labels/train"
+VAL_IMG_DIR = f"{WORK_DIR}/images/val"
+VAL_LBL_DIR = f"{WORK_DIR}/labels/val"
 
 if os.path.exists(WORK_DIR): shutil.rmtree(WORK_DIR)
 os.makedirs(IMG_DIR, exist_ok=True)
 os.makedirs(LBL_DIR, exist_ok=True)
+os.makedirs(VAL_IMG_DIR, exist_ok=True)
+os.makedirs(VAL_LBL_DIR, exist_ok=True)
 
 print(f"\n1. PREPARING DATASET in {WORK_DIR}...")
 
-# Symlink ORIGINAL TRAIN data
-orig_train_img = f"{ROOT_DIR}/images/train"
-orig_train_lbl = f"{ROOT_DIR}/labels/train"
+orig_train_img = Path(ROOT_DIR) / "images" / "train"
+orig_train_lbl = Path(ROOT_DIR) / "labels" / "train"
 
-print("   Linking original training data...")
-for f in os.listdir(orig_train_img):
-    if f.endswith('.jpg'):
-        os.symlink(os.path.abspath(f"{orig_train_img}/{f}"), f"{IMG_DIR}/{f}")
-for f in os.listdir(orig_train_lbl):
-    if f.endswith('.txt'):
-         # Copy labels (don't symlink, we might want to modify/view them)
-        shutil.copy(f"{orig_train_lbl}/{f}", f"{LBL_DIR}/{f}")
+print("   Preparing original training data (train/val split)...")
+train_files = sorted([f.name for f in orig_train_img.iterdir() if f.suffix.lower() == ".jpg"])
+train_split, val_split = stratified_split(train_files, orig_train_lbl, VAL_RATIO, SEED)
 
-# Symlink TEST data (images only)
-print("   Linking test data...")
-test_dir = f"{ROOT_DIR}/images/test"
-test_files = [f for f in os.listdir(test_dir) if f.endswith('.jpg')]
-for f in test_files:
-    os.symlink(os.path.abspath(f"{test_dir}/{f}"), f"{IMG_DIR}/{f}")
+for f in train_split:
+    link_or_copy(orig_train_img / f, Path(IMG_DIR) / f, USE_SYMLINKS)
+    src_lbl = orig_train_lbl / f"{Path(f).stem}.txt"
+    if src_lbl.exists():
+        shutil.copy2(src_lbl, Path(LBL_DIR) / f"{Path(f).stem}.txt")
+    else:
+        Path(LBL_DIR, f"{Path(f).stem}.txt").write_text("")
 
-print(f"   Total Images: {len(os.listdir(IMG_DIR))}")
+for f in val_split:
+    link_or_copy(orig_train_img / f, Path(VAL_IMG_DIR) / f, USE_SYMLINKS)
+    src_lbl = orig_train_lbl / f"{Path(f).stem}.txt"
+    if src_lbl.exists():
+        shutil.copy2(src_lbl, Path(VAL_LBL_DIR) / f"{Path(f).stem}.txt")
+    else:
+        Path(VAL_LBL_DIR, f"{Path(f).stem}.txt").write_text("")
+
+# Keep list of test files for pseudo labeling + submission
+print("   Reading test data...")
+test_dir = Path(ROOT_DIR) / "images" / "test"
+test_files = [f.name for f in test_dir.iterdir() if f.suffix.lower() == ".jpg"]
+
+print(f"   Train images: {len(train_split)}, Val images: {len(val_split)}")
+print(f"   Test images: {len(test_files)}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. Generate Pseudo-Labels
@@ -88,6 +166,7 @@ print(f"   Model: {os.path.basename(BEST_MODEL)}")
 
 model = RTDETR(BEST_MODEL)
 pseudo_count = 0
+added_pseudo = 0
 
 for i, fname in enumerate(test_files):
     img_path = f"{test_dir}/{fname}"
@@ -95,7 +174,8 @@ for i, fname in enumerate(test_files):
     # TTA Inference for best quality labels
     results = model.predict(img_path, conf=CONF_THRESHOLD, imgsz=IMG_SIZE, augment=True, verbose=False)[0]
     
-    label_path = f"{LBL_DIR}/{fname.replace('.jpg', '.txt')}"
+    pseudo_name = f"pseudo_{fname}"
+    label_path = f"{LBL_DIR}/{pseudo_name.replace('.jpg', '.txt')}"
     
     lines = []
     if hasattr(results, 'boxes'):
@@ -105,25 +185,29 @@ for i, fname in enumerate(test_files):
             x, y, w, h = box.xywhn[0].tolist()
             lines.append(f"{cls} {x:.6f} {y:.6f} {w:.6f} {h:.6f}")
     
-    # Write label file (even if empty, to confirm it was processed, 
-    # though for training usually we only care about files with targets or background)
-    # RT-DETR handles empty label files as background images.
-    with open(label_path, 'w') as f:
-        f.write("\n".join(lines))
-        
-    if lines: pseudo_count += 1
+    # Only add pseudo images if we have labels (unless INCLUDE_EMPTY_PSEUDO is True).
+    if lines or INCLUDE_EMPTY_PSEUDO:
+        with open(label_path, 'w') as f:
+            f.write("\n".join(lines))
+        link_or_copy(Path(test_dir) / fname, Path(IMG_DIR) / pseudo_name, USE_SYMLINKS)
+        added_pseudo += 1
+        if lines:
+            pseudo_count += 1
+
     if i % 100 == 0: print(f"   Processed {i}/{len(test_files)}...")
 
 print(f"   Pseudo-labels generated for {pseudo_count}/{len(test_files)} test images.")
+print(f"   Pseudo images added to train: {added_pseudo}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. Create YAML
 # ══════════════════════════════════════════════════════════════════════════════
 yaml_content = f"""path: {os.path.abspath(WORK_DIR)}
 train: images/train
-val: images/train  # Validate on everything (or split if you prefer)
+val: images/val
+nc: 2
 names:
-  0: person
+  0: head
   1: shemagh
 """
 with open(f"{WORK_DIR}/data.yaml", 'w') as f:
@@ -153,11 +237,21 @@ train_model.train(
 # ══════════════════════════════════════════════════════════════════════════════
 print(f"\n4. GENERATING SUBMISSION...")
 
-NEW_MODEL_PATH = "pseudo_runs/rtdetr_pseudo/weights/best.pt"
+NEW_MODEL_PATH = None
+try:
+    NEW_MODEL_PATH = str(train_model.trainer.best)
+except Exception:
+    NEW_MODEL_PATH = None
+
+if not NEW_MODEL_PATH or not os.path.exists(NEW_MODEL_PATH):
+    candidate = Path("pseudo_runs") / "rtdetr_pseudo" / "weights" / "best.pt"
+    if candidate.exists():
+        NEW_MODEL_PATH = str(candidate)
+
 F1_HEAD = os.path.join(SCRIPT_DIR, "models", "head_m640_best.pt")
 F1_SHEM = os.path.join(SCRIPT_DIR, "models", "shemagh_m640_best.pt")
 
-if not os.path.exists(NEW_MODEL_PATH):
+if not NEW_MODEL_PATH or not os.path.exists(NEW_MODEL_PATH):
     print("Optimization failed? best.pt not found. Using last known best.")
     NEW_MODEL_PATH = BEST_MODEL
 
