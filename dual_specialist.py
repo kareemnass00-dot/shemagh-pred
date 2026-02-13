@@ -1,9 +1,11 @@
 """
-DAL-Shemagh v15 — Hybrid: Tight Postprocessing + Single mAP Model
+DAL-Shemagh v16 — YOLO11n mAP + F1 Specialists
 # ============================================================
-# F1 → Dual specialists (head + shemagh) → right_place
-# mAP → Single model (s_640) both classes + aggressive postprocessing
-# Target: match baseline's box density (~1100 boxes, avg conf ~0.76)
+# mAP: YOLO11n @ 640 + oversampled negatives (val mAP50-95=0.884)
+# F1:  YOLOv8m specialists (head + shemagh) → right_place
+# Inference conf=0.25 (like baseline)
+# ============================================================
+# TODO: Train y11n for 150+ epochs for potential improvement
 # ============================================================
 """
 import os
@@ -40,12 +42,12 @@ print(f"Using Data at: {ROOT_DIR}")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 M = lambda name: os.path.join(SCRIPT_DIR, "models", name)
 
-# F1 specialists (for right_place only)
+# F1 specialists (for right_place)
 F1_HEAD_WEIGHTS    = M("head_m640_best.pt")
 F1_SHEMAGH_WEIGHTS = M("shemagh_m640_best.pt")
 
-# Single mAP model — s_640 (best overall mAP50-95=0.7392)
-MAP_WEIGHTS = M("map_head_s640_best.pt")
+# mAP model — YOLO11n (mAP50-95=0.884 on val)
+MAP_WEIGHTS = M("map_y11n_best.pt")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Settings
@@ -54,11 +56,9 @@ F1_IMGSZ = 640
 F1_CONF = 0.15
 OVERLAP_THRESHOLD = 0.10
 
-# mAP — tighter postprocessing to match baseline density
+# mAP inference — conf=0.25 like baseline
 MAP_IMGSZ = 640
-MAP_CONF = 0.10            # Higher YOLO pre-filter (was 0.01)
-MAP_MAX_DET_PER_CLASS = 3  # Tighter cap (was 5)
-MAP_CONF_MIN = 0.15        # Higher floor (was 0.05)
+MAP_CONF = 0.25
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Load Models
@@ -68,7 +68,7 @@ print("  LOADING MODELS")
 print("="*60)
 
 for label, path in [("F1 head", F1_HEAD_WEIGHTS), ("F1 shemagh", F1_SHEMAGH_WEIGHTS),
-                     ("mAP (s_640)", MAP_WEIGHTS)]:
+                     ("mAP y11n", MAP_WEIGHTS)]:
     assert os.path.exists(path), f"{label} not found: {path}"
     print(f"  ✓ {label}: {os.path.basename(path)}")
 
@@ -128,37 +128,16 @@ for fname in test_files:
             if rp: break
     
     # ── mAP PIPELINE → prediction_string ──
-    # Single model, both classes, with TTA
     res_map = map_model.predict(img_path, conf=MAP_CONF, imgsz=MAP_IMGSZ, augment=True, verbose=False)[0]
     
-    # Separate by class, filter, cap top-K
-    head_boxes = []
-    shem_boxes = []
+    parts = []
     for box in res_map.boxes:
         cls = int(box.cls[0])
         conf = float(box.conf[0])
-        if conf < MAP_CONF_MIN:
-            continue
         x, y, w, h = box.xywhn[0].tolist()
-        if cls == 0:
-            head_boxes.append((conf, x, y, w, h))
-        elif cls == 1:
-            shem_boxes.append((conf, x, y, w, h))
-    
-    head_boxes.sort(reverse=True)
-    shem_boxes.sort(reverse=True)
-    head_boxes = head_boxes[:MAP_MAX_DET_PER_CLASS]
-    shem_boxes = shem_boxes[:MAP_MAX_DET_PER_CLASS]
-    
-    total_head_boxes += len(head_boxes)
-    total_shem_boxes += len(shem_boxes)
-    
-    # Build prediction string
-    parts = []
-    for conf, x, y, w, h in head_boxes:
-        parts.extend(["0", f"{conf:.4f}", f"{x:.4f}", f"{y:.4f}", f"{w:.4f}", f"{h:.4f}"])
-    for conf, x, y, w, h in shem_boxes:
-        parts.extend(["1", f"{conf:.4f}", f"{x:.4f}", f"{y:.4f}", f"{w:.4f}", f"{h:.4f}"])
+        parts.extend([str(cls), f"{conf:.4f}", f"{x:.4f}", f"{y:.4f}", f"{w:.4f}", f"{h:.4f}"])
+        if cls == 0: total_head_boxes += 1
+        else: total_shem_boxes += 1
     
     pred_str = " ".join(parts) if parts else "-"
     submission.append([fname, rp, pred_str])
