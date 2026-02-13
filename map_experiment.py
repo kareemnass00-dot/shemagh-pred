@@ -51,8 +51,8 @@ EXPERIMENTS = [
     ("s_640",  "yolov8s.pt", 640,  32, "moderate"),
     ("m_640",  "yolov8m.pt", 640,  32, "moderate"),
     ("l_640",  "yolov8l.pt", 640,  16, "moderate"),
-    # v1 winner for comparison
-    ("l_960",  "yolov8l.pt", 960,  8,  "moderate"),
+    # Already ran — l_960: mAP50-95=0.6506 ★
+    # ("l_960",  "yolov8l.pt", 960,  12, "moderate"),
 ]
 
 # Moderate aug: enough diversity, low geometric distortion for tight boxes
