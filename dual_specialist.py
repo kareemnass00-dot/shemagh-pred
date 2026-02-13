@@ -1,16 +1,18 @@
 """
-DAL-Shemagh v16 — YOLO11n mAP + F1 Specialists
+DAL-Shemagh v17 — RT-DETR-L mAP + F1 Specialists
 # ============================================================
-# mAP: YOLO11n @ 640 + oversampled negatives (val mAP50-95=0.884)
+# mAP: RT-DETR-L @ 640 (mAP50-95=0.948 val)
 # F1:  YOLOv8m specialists (head + shemagh) → right_place
-# Inference conf=0.25 (like baseline)
+# Inference conf=0.25
 # ============================================================
-# TODO: Train y11n for 150+ epochs for potential improvement
+# Notes:
+# - RT-DETR provides cleaner boxes, no NMS artifacts.
+# - F1 specialists handle the classification task.
 # ============================================================
 """
 import os
 import sys
-from ultralytics import YOLO
+from ultralytics import YOLO, RTDETR  # Using RTDETR class
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 0. Path Detection
@@ -46,8 +48,8 @@ M = lambda name: os.path.join(SCRIPT_DIR, "models", name)
 F1_HEAD_WEIGHTS    = M("head_m640_best.pt")
 F1_SHEMAGH_WEIGHTS = M("shemagh_m640_best.pt")
 
-# mAP model — YOLO11n (mAP50-95=0.884 on val)
-MAP_WEIGHTS = M("map_y11n_best.pt")
+# mAP model — RT-DETR-L (mAP50-95=0.948 on val)
+MAP_WEIGHTS = M("map_rtdetr_l_best.pt")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Settings
@@ -56,7 +58,7 @@ F1_IMGSZ = 640
 F1_CONF = 0.15
 OVERLAP_THRESHOLD = 0.10
 
-# mAP inference — conf=0.25 like baseline
+# mAP inference — RT-DETR works well with standard conf
 MAP_IMGSZ = 640
 MAP_CONF = 0.25
 
@@ -64,17 +66,17 @@ MAP_CONF = 0.25
 # 1. Load Models
 # ══════════════════════════════════════════════════════════════════════════════
 print("\n" + "="*60)
-print("  LOADING MODELS")
+print("  LOADING MODELS (RT-DETR + YOLOv8)")
 print("="*60)
 
 for label, path in [("F1 head", F1_HEAD_WEIGHTS), ("F1 shemagh", F1_SHEMAGH_WEIGHTS),
-                     ("mAP y11n", MAP_WEIGHTS)]:
+                     ("mAP rtdetr", MAP_WEIGHTS)]:
     assert os.path.exists(path), f"{label} not found: {path}"
     print(f"  ✓ {label}: {os.path.basename(path)}")
 
 f1_head    = YOLO(F1_HEAD_WEIGHTS)
 f1_shemagh = YOLO(F1_SHEMAGH_WEIGHTS)
-map_model  = YOLO(MAP_WEIGHTS)
+map_model  = RTDETR(MAP_WEIGHTS)  # Use RTDETR class
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. Inference
@@ -112,34 +114,45 @@ for fname in test_files:
     count += 1
     
     # ── F1 PIPELINE → right_place ──
-    res_fh = f1_head.predict(img_path, conf=F1_CONF, imgsz=F1_IMGSZ, augment=True, verbose=False)[0]
-    heads_f1 = [box.xywhn[0].tolist() for box in res_fh.boxes]
-    
-    res_fs = f1_shemagh.predict(img_path, conf=F1_CONF, imgsz=F1_IMGSZ, augment=True, verbose=False)[0]
-    shemaghs_f1 = [box.xywhn[0].tolist() for box in res_fs.boxes]
-    
-    rp = 0
-    if heads_f1 and shemaghs_f1:
-        for h in heads_f1:
-            for s in shemaghs_f1:
-                if get_overlap(h, s) > OVERLAP_THRESHOLD:
-                    rp = 1
-                    break
-            if rp: break
+    try:
+        res_fh = f1_head.predict(img_path, conf=F1_CONF, imgsz=F1_IMGSZ, augment=True, verbose=False)[0]
+        heads_f1 = [box.xywhn[0].tolist() for box in res_fh.boxes]
+        
+        res_fs = f1_shemagh.predict(img_path, conf=F1_CONF, imgsz=F1_IMGSZ, augment=True, verbose=False)[0]
+        shemaghs_f1 = [box.xywhn[0].tolist() for box in res_fs.boxes]
+        
+        rp = 0
+        if heads_f1 and shemaghs_f1:
+            for h in heads_f1:
+                for s in shemaghs_f1:
+                    if get_overlap(h, s) > OVERLAP_THRESHOLD:
+                        rp = 1
+                        break
+                if rp: break
+    except Exception as e:
+        print(f"Error in F1 prediction for {fname}: {e}")
+        rp = 0
     
     # ── mAP PIPELINE → prediction_string ──
-    res_map = map_model.predict(img_path, conf=MAP_CONF, imgsz=MAP_IMGSZ, augment=True, verbose=False)[0]
-    
-    parts = []
-    for box in res_map.boxes:
-        cls = int(box.cls[0])
-        conf = float(box.conf[0])
-        x, y, w, h = box.xywhn[0].tolist()
-        parts.extend([str(cls), f"{conf:.4f}", f"{x:.4f}", f"{y:.4f}", f"{w:.4f}", f"{h:.4f}"])
-        if cls == 0: total_head_boxes += 1
-        else: total_shem_boxes += 1
-    
-    pred_str = " ".join(parts) if parts else "-"
+    # RT-DETR prediction
+    try:
+        res_map = map_model.predict(img_path, conf=MAP_CONF, imgsz=MAP_IMGSZ, augment=False, verbose=False)[0] # RT-DETR usually no TTA
+        
+        parts = []
+        if hasattr(res_map, 'boxes'):
+            for box in res_map.boxes:
+                cls = int(box.cls[0])
+                conf = float(box.conf[0])
+                x, y, w, h = box.xywhn[0].tolist()
+                parts.extend([str(cls), f"{conf:.4f}", f"{x:.4f}", f"{y:.4f}", f"{w:.4f}", f"{h:.4f}"])
+                if cls == 0: total_head_boxes += 1
+                else: total_shem_boxes += 1
+        
+        pred_str = " ".join(parts) if parts else "-"
+    except Exception as e:
+        print(f"Error in mAP prediction for {fname}: {e}")
+        pred_str = "-"
+
     submission.append([fname, rp, pred_str])
 
 # ══════════════════════════════════════════════════════════════════════════════
