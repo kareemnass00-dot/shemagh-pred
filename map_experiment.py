@@ -36,10 +36,16 @@ WORK_DIR = "./yolo11_v4"
 # Experiments — NO oversampling, just vary model size
 # ══════════════════════════════════════════════════════════════════════════════
 EXPERIMENTS = [
-    ("y11n_baseline", "yolo11n.pt", 640, 16),  # Exact baseline
-    ("y11s_baseline", "yolo11s.pt", 640, 16),  # One step up
-    ("y11m_baseline", "yolo11m.pt", 640, 16),  # Medium
+    # Baseline recipe (100 epochs, val=train)
+    ("y11n_baseline", "yolo11n.pt", 640, 16, "baseline"),
+    ("y11s_baseline", "yolo11s.pt", 640, 16, "baseline"),
+    # Longer training (150 epochs)
+    ("y11n_150ep",    "yolo11n.pt", 640, 16, "baseline"),
+    ("y11s_150ep",    "yolo11s.pt", 640, 16, "baseline"),
 ]
+
+# Override epochs for 150ep variants
+EPOCH_OVERRIDE = {"y11n_150ep": 150, "y11s_150ep": 150}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Data — Just point to original data, val=train (like baseline)
@@ -81,9 +87,10 @@ def main():
     data_yaml = prepare_data()
     results_list = []
     
-    for exp_name, model_name, imgsz, batch in EXPERIMENTS:
+    for exp_name, model_name, imgsz, batch, _ in EXPERIMENTS:
+        exp_epochs = EPOCH_OVERRIDE.get(exp_name, EPOCHS)
         print(f"\n{'='*60}")
-        print(f"  {exp_name}: {model_name} @ {imgsz}")
+        print(f"  {exp_name}: {model_name} @ {imgsz}, {exp_epochs} epochs")
         print(f"{'='*60}")
         
         t0 = time.time()
@@ -91,7 +98,7 @@ def main():
         model = YOLO(model_name)
         model.train(
             data=data_yaml,
-            epochs=EPOCHS,
+            epochs=exp_epochs,
             imgsz=imgsz,
             batch=batch,
             project='./y11v4_experiments',
