@@ -1,18 +1,9 @@
 """
-DAL-Shemagh v14 — Quad Specialist Submission
+DAL-Shemagh v15 — Hybrid: Tight Postprocessing + Single mAP Model
 # ============================================================
-# Final Score = 0.5 × mAP@[0.5:0.95] + 0.5 × F1-Score
-#
-# 4 models, each a specialist:
-#   F1 head:     head_m640_best.pt    (right_place)
-#   F1 shemagh:  shemagh_m640_best.pt (right_place)
-#   mAP head:    map_head_s640_best.pt    → head boxes (class 0)
-#   mAP shemagh: map_shem_m640_best.pt    → shemagh boxes (class 1)
-#
-# Postprocessing for mAP:
-#   - Top-K per class per image
-#   - Class-specific confidence thresholds
-#   - TTA (augment=True)
+# F1 → Dual specialists (head + shemagh) → right_place
+# mAP → Single model (s_640) both classes + aggressive postprocessing
+# Target: match baseline's box density (~1100 boxes, avg conf ~0.76)
 # ============================================================
 """
 import os
@@ -38,8 +29,6 @@ for p in POSSIBLE_PATHS:
 
 if ROOT_DIR is None:
     print(f"ERROR: Could not find dataset in {POSSIBLE_PATHS}")
-    print("Files in current dir:", os.listdir("."))
-    if os.path.exists("./data"): print("Files in ./data:", os.listdir("./data"))
     sys.exit(1)
 
 os.system('pip install -U ultralytics')
@@ -51,55 +40,50 @@ print(f"Using Data at: {ROOT_DIR}")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 M = lambda name: os.path.join(SCRIPT_DIR, "models", name)
 
-# F1 specialists (single-class, for right_place)
+# F1 specialists (for right_place only)
 F1_HEAD_WEIGHTS    = M("head_m640_best.pt")
 F1_SHEMAGH_WEIGHTS = M("shemagh_m640_best.pt")
 
-# mAP specialists (multi-class, but we pick best per-class)
-MAP_HEAD_WEIGHTS   = M("map_head_s640_best.pt")    # s_640: head mAP=0.8652
-MAP_SHEM_WEIGHTS   = M("map_shem_m640_best.pt")    # m_640: shem mAP=0.6562
+# Single mAP model — s_640 (best overall mAP50-95=0.7392)
+MAP_WEIGHTS = M("map_head_s640_best.pt")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Inference Settings
+# Settings
 # ══════════════════════════════════════════════════════════════════════════════
-# F1 pipeline
 F1_IMGSZ = 640
 F1_CONF = 0.15
 OVERLAP_THRESHOLD = 0.10
 
-# mAP pipeline — postprocessing
+# mAP — tighter postprocessing to match baseline density
 MAP_IMGSZ = 640
-MAP_CONF = 0.01              # Low for max recall (mAP ranks by confidence)
-MAP_MAX_DET_PER_CLASS = 5    # Cap FPs
-MAP_HEAD_CONF_MIN = 0.05     # Floor for head boxes
-MAP_SHEM_CONF_MIN = 0.05     # Floor for shemagh boxes
+MAP_CONF = 0.10            # Higher YOLO pre-filter (was 0.01)
+MAP_MAX_DET_PER_CLASS = 3  # Tighter cap (was 5)
+MAP_CONF_MIN = 0.15        # Higher floor (was 0.05)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. Load All 4 Models
+# 1. Load Models
 # ══════════════════════════════════════════════════════════════════════════════
 print("\n" + "="*60)
-print("  LOADING 4 SPECIALIST MODELS")
+print("  LOADING MODELS")
 print("="*60)
 
 for label, path in [("F1 head", F1_HEAD_WEIGHTS), ("F1 shemagh", F1_SHEMAGH_WEIGHTS),
-                     ("mAP head", MAP_HEAD_WEIGHTS), ("mAP shemagh", MAP_SHEM_WEIGHTS)]:
-    assert os.path.exists(path), f"{label} weights not found: {path}"
+                     ("mAP (s_640)", MAP_WEIGHTS)]:
+    assert os.path.exists(path), f"{label} not found: {path}"
     print(f"  ✓ {label}: {os.path.basename(path)}")
 
 f1_head    = YOLO(F1_HEAD_WEIGHTS)
 f1_shemagh = YOLO(F1_SHEMAGH_WEIGHTS)
-map_head   = YOLO(MAP_HEAD_WEIGHTS)
-map_shem   = YOLO(MAP_SHEM_WEIGHTS)
+map_model  = YOLO(MAP_WEIGHTS)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. Inference
 # ══════════════════════════════════════════════════════════════════════════════
 print("\n" + "="*60)
-print("  QUAD SPECIALIST INFERENCE")
+print("  INFERENCE")
 print("="*60)
 
 def get_overlap(box_a, box_b):
-    """Overlap = intersection / smaller box area."""
     ax, ay, aw, ah = box_a
     bx, by, bw, bh = box_b
     ax1, ay1, ax2, ay2 = ax-aw/2, ay-ah/2, ax+aw/2, ay+ah/2
@@ -118,6 +102,8 @@ submission = []
 
 count = 0
 total = len(test_files)
+total_head_boxes = 0
+total_shem_boxes = 0
 
 for fname in test_files:
     img_path = f"{test_dir}/{fname}"
@@ -125,9 +111,7 @@ for fname in test_files:
         print(f"Processing {count}/{total}...")
     count += 1
     
-    # ────────────────────────────────────────────────────────
-    # F1 PIPELINE → right_place
-    # ────────────────────────────────────────────────────────
+    # ── F1 PIPELINE → right_place ──
     res_fh = f1_head.predict(img_path, conf=F1_CONF, imgsz=F1_IMGSZ, augment=True, verbose=False)[0]
     heads_f1 = [box.xywhn[0].tolist() for box in res_fh.boxes]
     
@@ -143,32 +127,31 @@ for fname in test_files:
                     break
             if rp: break
     
-    # ────────────────────────────────────────────────────────
-    # mAP PIPELINE → prediction_string
-    # ────────────────────────────────────────────────────────
-    # Head boxes from s_640 model (class 0 only)
-    res_mh = map_head.predict(img_path, conf=MAP_CONF, imgsz=MAP_IMGSZ, augment=True, verbose=False)[0]
-    head_boxes = []
-    for box in res_mh.boxes:
-        cls = int(box.cls[0])
-        conf = float(box.conf[0])
-        if cls == 0 and conf >= MAP_HEAD_CONF_MIN:
-            x, y, w, h = box.xywhn[0].tolist()
-            head_boxes.append((conf, x, y, w, h))
-    head_boxes.sort(reverse=True)
-    head_boxes = head_boxes[:MAP_MAX_DET_PER_CLASS]
+    # ── mAP PIPELINE → prediction_string ──
+    # Single model, both classes, with TTA
+    res_map = map_model.predict(img_path, conf=MAP_CONF, imgsz=MAP_IMGSZ, augment=True, verbose=False)[0]
     
-    # Shemagh boxes from m_640 model (class 1 only)
-    res_ms = map_shem.predict(img_path, conf=MAP_CONF, imgsz=MAP_IMGSZ, augment=True, verbose=False)[0]
+    # Separate by class, filter, cap top-K
+    head_boxes = []
     shem_boxes = []
-    for box in res_ms.boxes:
+    for box in res_map.boxes:
         cls = int(box.cls[0])
         conf = float(box.conf[0])
-        if cls == 1 and conf >= MAP_SHEM_CONF_MIN:
-            x, y, w, h = box.xywhn[0].tolist()
+        if conf < MAP_CONF_MIN:
+            continue
+        x, y, w, h = box.xywhn[0].tolist()
+        if cls == 0:
+            head_boxes.append((conf, x, y, w, h))
+        elif cls == 1:
             shem_boxes.append((conf, x, y, w, h))
+    
+    head_boxes.sort(reverse=True)
     shem_boxes.sort(reverse=True)
+    head_boxes = head_boxes[:MAP_MAX_DET_PER_CLASS]
     shem_boxes = shem_boxes[:MAP_MAX_DET_PER_CLASS]
+    
+    total_head_boxes += len(head_boxes)
+    total_shem_boxes += len(shem_boxes)
     
     # Build prediction string
     parts = []
@@ -181,14 +164,14 @@ for fname in test_files:
     submission.append([fname, rp, pred_str])
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. Save Submission
+# 3. Save
 # ══════════════════════════════════════════════════════════════════════════════
 right_place_count = sum([x[1] for x in submission])
-total_boxes = sum(len(x[2].split()) // 6 for x in submission if x[2] != '-')
+total_boxes = total_head_boxes + total_shem_boxes
 print(f"\nDone!")
 print(f"  right_place=1: {right_place_count}/{total}")
-print(f"  Total boxes: {total_boxes}")
-print(f"  Avg boxes/image: {total_boxes/total:.1f}")
+print(f"  Head boxes: {total_head_boxes}, Shemagh boxes: {total_shem_boxes}")
+print(f"  Total boxes: {total_boxes}, Avg/img: {total_boxes/total:.1f}")
 
 with open('submission_dual.csv', 'w') as f:
     f.write("filename,right_place,prediction_string\n")
