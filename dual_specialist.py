@@ -1,18 +1,29 @@
 """
-DAL-Shemagh v17 — RT-DETR-L mAP + F1 Specialists
+DAL-Shemagh v18 — 4-Model WBF Ensemble
 # ============================================================
-# mAP: RT-DETR-L @ 640 (mAP50-95=0.948 val)
-# F1:  YOLOv8m specialists (head + shemagh) → right_place
-# Inference conf=0.25
-# ============================================================
-# Notes:
-# - RT-DETR provides cleaner boxes, no NMS artifacts.
-# - F1 specialists handle the classification task.
+# Ensemble of 4 models using Weighted Box Fusion (WBF):
+# 1. RT-DETR-L (mAP ~0.948)
+# 2. YOLO11n   (mAP ~0.933)
+# 3. YOLO11s   (mAP ~0.925)
+# 4. RT-DETR-X (mAP ~0.919)
+#
+# WBF creates a "consensus" prediction that is cleaner and
+# more accurate than any single model. This is how you win.
+#
+# F1 Specialists (Head/Shemagh) still used for right_place logic.
 # ============================================================
 """
 import os
 import sys
-from ultralytics import YOLO, RTDETR  # Using RTDETR class
+import numpy as np
+from ultralytics import YOLO, RTDETR
+
+# Install dependencies if missing
+try:
+    from ensemble_boxes import weighted_boxes_fusion
+except ImportError:
+    os.system('pip install -U ensemble-boxes')
+    from ensemble_boxes import weighted_boxes_fusion
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 0. Path Detection
@@ -35,7 +46,6 @@ if ROOT_DIR is None:
     print(f"ERROR: Could not find dataset in {POSSIBLE_PATHS}")
     sys.exit(1)
 
-os.system('pip install -U ultralytics')
 print(f"Using Data at: {ROOT_DIR}")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -48,44 +58,20 @@ M = lambda name: os.path.join(SCRIPT_DIR, "models", name)
 F1_HEAD_WEIGHTS    = M("head_m640_best.pt")
 F1_SHEMAGH_WEIGHTS = M("shemagh_m640_best.pt")
 
-# mAP model — RT-DETR-L (mAP50-95=0.948 on val)
-MAP_WEIGHTS = M("map_rtdetr_l_best.pt")
+# Ensemble Models (Detection)
+ENSEMBLE_MODELS = [
+    # (weight_path, model_type, weight_in_ensemble)
+    (M("map_rtdetr_l_best.pt"), RTDETR, 2.0), # Strongest model (0.948) gets double weight
+    (M("map_y11n_best.pt"),      YOLO,   1.0), # Fast & accurate (0.933)
+    (M("map_y11s.pt"),           YOLO,   1.0), # Good backup (0.925)
+    (M("map_rtdetr_x_best.pt"),  RTDETR, 1.0), # Diverse architecture (0.919)
+]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Settings
+# Helper Functions
 # ══════════════════════════════════════════════════════════════════════════════
-F1_IMGSZ = 640
-F1_CONF = 0.15
-OVERLAP_THRESHOLD = 0.10
-
-# mAP inference — RT-DETR works well with standard conf
-MAP_IMGSZ = 640
-MAP_CONF = 0.25
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 1. Load Models
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n" + "="*60)
-print("  LOADING MODELS (RT-DETR + YOLOv8)")
-print("="*60)
-
-for label, path in [("F1 head", F1_HEAD_WEIGHTS), ("F1 shemagh", F1_SHEMAGH_WEIGHTS),
-                     ("mAP rtdetr", MAP_WEIGHTS)]:
-    assert os.path.exists(path), f"{label} not found: {path}"
-    print(f"  ✓ {label}: {os.path.basename(path)}")
-
-f1_head    = YOLO(F1_HEAD_WEIGHTS)
-f1_shemagh = YOLO(F1_SHEMAGH_WEIGHTS)
-map_model  = RTDETR(MAP_WEIGHTS)  # Use RTDETR class
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 2. Inference
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n" + "="*60)
-print("  INFERENCE")
-print("="*60)
-
 def get_overlap(box_a, box_b):
+    """Calculates intersection over minimum area for classification logic"""
     ax, ay, aw, ah = box_a
     bx, by, bw, bh = box_b
     ax1, ay1, ax2, ay2 = ax-aw/2, ay-ah/2, ax+aw/2, ay+ah/2
@@ -98,76 +84,154 @@ def get_overlap(box_a, box_b):
     if min_area <= 0: return 0
     return inter / min_area
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. Load Models
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("  LOADING MODELS")
+print("="*60)
+
+# Load F1 models
+f1_head    = YOLO(F1_HEAD_WEIGHTS)
+f1_shemagh = YOLO(F1_SHEMAGH_WEIGHTS)
+
+# Load Ensemble Detection Models
+detection_models = []
+weights_list = [] # Weights for WBF aggregation
+
+for path, ModelClass, w in ENSEMBLE_MODELS:
+    if os.path.exists(path):
+        print(f"  ✓ Loaded Detection Model ({w}x): {os.path.basename(path)}")
+        m = ModelClass(path)
+        detection_models.append(m)
+        weights_list.append(w)
+    else:
+        print(f"  ⚠ WARNING: Model not found: {path} (Skipping)")
+
+if not detection_models:
+    print("ERROR: No detection models loaded!")
+    sys.exit(1)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. Inference Loop
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print(f"  STARTING INFERENCE ON {len(detection_models)} MODELS")
+print("="*60)
+
 test_dir = f"{ROOT_DIR}/images/test"
 test_files = sorted(os.listdir(test_dir))
 submission = []
 
-count = 0
-total = len(test_files)
-total_head_boxes = 0
-total_shem_boxes = 0
+params = {
+    'conf': 0.15,       # Low conf for ensemble (WBF will filter/merge)
+    'imgsz': 640
+}
+wbf_iou_thr = 0.55      # IoU threshold for merging boxes
+wbf_skip_box_thr = 0.10 # Discard boxes with low score after fusion
 
-for fname in test_files:
+# Statistics
+total_processed = 0
+total_dets = 0
+
+for idx, fname in enumerate(test_files):
     img_path = f"{test_dir}/{fname}"
-    if count % 100 == 0:
-        print(f"Processing {count}/{total}...")
-    count += 1
-    
-    # ── F1 PIPELINE → right_place ──
+    if idx % 50 == 0:
+        print(f"Processing {idx}/{len(test_files)}...")
+
+    # 1. Run F1 Specialists (Classification Logic)
+    rp = 0
     try:
-        res_fh = f1_head.predict(img_path, conf=F1_CONF, imgsz=F1_IMGSZ, augment=True, verbose=False)[0]
-        heads_f1 = [box.xywhn[0].tolist() for box in res_fh.boxes]
+        # TTA used for classification robustness
+        res_h = f1_head.predict(img_path, conf=0.15, augment=True, verbose=False)[0]
+        res_s = f1_shemagh.predict(img_path, conf=0.15, augment=True, verbose=False)[0]
         
-        res_fs = f1_shemagh.predict(img_path, conf=F1_CONF, imgsz=F1_IMGSZ, augment=True, verbose=False)[0]
-        shemaghs_f1 = [box.xywhn[0].tolist() for box in res_fs.boxes]
+        heads = [b.xywhn[0].tolist() for b in res_h.boxes]
+        shemaghs = [b.xywhn[0].tolist() for b in res_s.boxes]
         
-        rp = 0
-        if heads_f1 and shemaghs_f1:
-            for h in heads_f1:
-                for s in shemaghs_f1:
-                    if get_overlap(h, s) > OVERLAP_THRESHOLD:
+        if heads and shemaghs:
+            for h in heads:
+                for s in shemaghs:
+                    if get_overlap(h, s) > 0.10: # Overlap threshold
                         rp = 1
                         break
                 if rp: break
     except Exception as e:
-        print(f"Error in F1 prediction for {fname}: {e}")
-        rp = 0
+        # Fallback to 0
+        pass
+
+    # 2. Run Detection Ensemble (mAP Logic)
+    boxes_list = []
+    scores_list = []
+    labels_list = []
     
-    # ── mAP PIPELINE → prediction_string ──
-    # RT-DETR prediction
     try:
-        res_map = map_model.predict(img_path, conf=MAP_CONF, imgsz=MAP_IMGSZ, augment=False, verbose=False)[0] # RT-DETR usually no TTA
+        for model in detection_models:
+            # Standard inference (no TTA for speed/stability in ensemble unless needed)
+            res = model.predict(img_path, conf=params['conf'], imgsz=params['imgsz'], verbose=False)[0]
+            
+            # Extract boxes
+            if len(res.boxes) > 0:
+                # wrapper for normalized xyxy
+                b_xyxyn = res.boxes.xyxyn.cpu().numpy().tolist()
+                b_conf  = res.boxes.conf.cpu().numpy().tolist()
+                b_cls   = res.boxes.cls.cpu().numpy().tolist()
+                
+                boxes_list.append(b_xyxyn)
+                scores_list.append(b_conf)
+                labels_list.append(b_cls)
+            else:
+                boxes_list.append([])
+                scores_list.append([])
+                labels_list.append([])
+
+        # 3. Apply Weighted Box Fusion
+        # Models with empty preds are handled by WBF gracefully
+        boxes, scores, labels = weighted_boxes_fusion(
+            boxes_list,
+            scores_list,
+            labels_list,
+            weights=weights_list,
+            iou_thr=wbf_iou_thr,
+            skip_box_thr=wbf_skip_box_thr,
+            conf_type='avg' # Average scores of merged boxes
+        )
         
+        # 4. Format Prediction String
         parts = []
-        if hasattr(res_map, 'boxes'):
-            for box in res_map.boxes:
-                cls = int(box.cls[0])
-                conf = float(box.conf[0])
-                x, y, w, h = box.xywhn[0].tolist()
-                parts.extend([str(cls), f"{conf:.4f}", f"{x:.4f}", f"{y:.4f}", f"{w:.4f}", f"{h:.4f}"])
-                if cls == 0: total_head_boxes += 1
-                else: total_shem_boxes += 1
-        
+        for i in range(len(boxes)):
+            cls = int(labels[i])
+            score = float(scores[i])
+            x1, y1, x2, y2 = boxes[i]
+            
+            # Convert xyxy normalized back to xywh normalized for submission
+            w = x2 - x1
+            h = y2 - y1
+            cx = x1 + w/2
+            cy = y1 + h/2
+            
+            parts.extend([str(cls), f"{score:.4f}", f"{cx:.4f}", f"{cy:.4f}", f"{w:.4f}", f"{h:.4f}"])
+            total_dets += 1
+            
         pred_str = " ".join(parts) if parts else "-"
+
     except Exception as e:
-        print(f"Error in mAP prediction for {fname}: {e}")
+        print(f"Ensemble Error {fname}: {e}")
         pred_str = "-"
 
     submission.append([fname, rp, pred_str])
+    total_processed += 1
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. Save
+# 3. Save Submission
 # ══════════════════════════════════════════════════════════════════════════════
-right_place_count = sum([x[1] for x in submission])
-total_boxes = total_head_boxes + total_shem_boxes
-print(f"\nDone!")
-print(f"  right_place=1: {right_place_count}/{total}")
-print(f"  Head boxes: {total_head_boxes}, Shemagh boxes: {total_shem_boxes}")
-print(f"  Total boxes: {total_boxes}, Avg/img: {total_boxes/total:.1f}")
+print(f"\nCompleted {total_processed} files.")
+print(f"Total Detections: {total_dets} (Avg {total_dets/total_processed:.2f}/img)")
 
-with open('submission_dual.csv', 'w') as f:
+out_file = "submission_ensemble_wbf.csv"
+with open(out_file, 'w') as f:
     f.write("filename,right_place,prediction_string\n")
     for row in submission:
         f.write(f"{row[0]},{row[1]},{row[2]}\n")
 
-print("Saved submission_dual.csv")
+print(f"Saved {out_file}")
