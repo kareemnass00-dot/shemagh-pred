@@ -13,19 +13,28 @@ import os
 import sys
 import shutil
 import random
+import argparse
 from pathlib import Path
 from ultralytics import YOLO, RTDETR
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Config
 # ══════════════════════════════════════════════════════════════════════════════
-CONF_THRESHOLD = 0.60  # Only trust high-conf predictions for pseudo-labels
-EPOCHS = 50            # Fine-tune epochs
+CONF_THRESHOLD = 0.70  # Only trust high-conf predictions for pseudo-labels
+EPOCHS = 100           # Fine-tune epochs
+PATIENCE = 30          # Early stopping patience
 IMG_SIZE = 640
 SEED = 42
 VAL_RATIO = 0.20
 INCLUDE_EMPTY_PSEUDO = False  # add empty pseudo labels as negatives
 USE_SYMLINKS = True           # symlink images to save space
+
+parser = argparse.ArgumentParser(description="Pseudo-labeling (self-training)")
+parser.add_argument("--epochs", type=int, default=EPOCHS, help="Fine-tune epochs")
+parser.add_argument("--patience", type=int, default=PATIENCE, help="Early stopping patience")
+args = parser.parse_args()
+EPOCHS = args.epochs
+PATIENCE = args.patience
 
 # Paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -171,8 +180,8 @@ added_pseudo = 0
 for i, fname in enumerate(test_files):
     img_path = f"{test_dir}/{fname}"
     
-    # TTA Inference for best quality labels
-    results = model.predict(img_path, conf=CONF_THRESHOLD, imgsz=IMG_SIZE, augment=True, verbose=False)[0]
+    # Safer pseudo labels (no TTA)
+    results = model.predict(img_path, conf=CONF_THRESHOLD, imgsz=IMG_SIZE, augment=False, verbose=False)[0]
     
     pseudo_name = f"pseudo_{fname}"
     label_path = f"{LBL_DIR}/{pseudo_name.replace('.jpg', '.txt')}"
@@ -223,13 +232,31 @@ train_model = RTDETR(BEST_MODEL)
 train_model.train(
     data=f"{WORK_DIR}/data.yaml",
     epochs=EPOCHS,
+    patience=PATIENCE,
     imgsz=IMG_SIZE,
     batch=8,
     project='pseudo_runs',
     name='rtdetr_pseudo',
     exist_ok=True,
-    augment=True,      # Keep augmentations
-    optimizer='auto'
+    # Safe training settings to avoid NaNs on noisy pseudo-labels
+    augment=False,
+    amp=False,
+    mosaic=0.0,
+    mixup=0.0,
+    copy_paste=0.0,
+    erasing=0.0,
+    hsv_h=0.02,
+    hsv_s=0.2,
+    hsv_v=0.2,
+    degrees=0.0,
+    translate=0.05,
+    scale=0.1,
+    shear=0.0,
+    lr0=1e-4,
+    lrf=0.01,
+    optimizer='AdamW',
+    weight_decay=5e-4,
+    warmup_epochs=1.0
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
