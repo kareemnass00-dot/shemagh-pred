@@ -47,9 +47,12 @@ WORK_DIR = "./yolo_map_exp"
 # Experiment Configs
 # ══════════════════════════════════════════════════════════════════════════════
 EXPERIMENTS = [
-    # Top 2 from v1 results
-    ("l_960",        "yolov8l.pt",  960,  12, "moderate"),
-    ("x_1280_light", "yolov8x.pt",  1280, 4,  "light"),
+    # 640px — won F1 experiments, never tested for mAP
+    ("s_640",  "yolov8s.pt", 640,  32, "moderate"),
+    ("m_640",  "yolov8m.pt", 640,  32, "moderate"),
+    ("l_640",  "yolov8l.pt", 640,  16, "moderate"),
+    # v1 winner for comparison
+    ("l_960",  "yolov8l.pt", 960,  12, "moderate"),
 ]
 
 # Moderate aug: enough diversity, low geometric distortion for tight boxes
