@@ -1,16 +1,18 @@
 """
-DAL-Shemagh v13 — Hybrid Submission
+DAL-Shemagh v14 — Quad Specialist Submission
 # ============================================================
 # Final Score = 0.5 × mAP@[0.5:0.95] + 0.5 × F1-Score
 #
-# Strategy:
-#   F1 → Dual specialist models (head + shemagh) + all-pairs overlap
-#   mAP → Single multi-class model + postprocessing
+# 4 models, each a specialist:
+#   F1 head:     head_m640_best.pt    (right_place)
+#   F1 shemagh:  shemagh_m640_best.pt (right_place)
+#   mAP head:    map_head_s640_best.pt    → head boxes (class 0)
+#   mAP shemagh: map_shem_m640_best.pt    → shemagh boxes (class 1)
 #
 # Postprocessing for mAP:
-#   - Top-K detections per class per image (cap FPs)
+#   - Top-K per class per image
 #   - Class-specific confidence thresholds
-#   - NMS already handled by YOLO, but we tune iou threshold
+#   - TTA (augment=True)
 # ============================================================
 """
 import os
@@ -18,7 +20,7 @@ import sys
 from ultralytics import YOLO
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 0. Path Detection & Config
+# 0. Path Detection
 # ══════════════════════════════════════════════════════════════════════════════
 POSSIBLE_PATHS = [
     "/kaggle/input/dal-shemagh-identification",
@@ -47,61 +49,53 @@ print(f"Using Data at: {ROOT_DIR}")
 # Model Paths
 # ══════════════════════════════════════════════════════════════════════════════
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+M = lambda name: os.path.join(SCRIPT_DIR, "models", name)
 
-# F1 models (specialist, single-class)
-HEAD_WEIGHTS = os.path.join(SCRIPT_DIR, "models", "head_m640_best.pt")
-SHEMAGH_WEIGHTS = os.path.join(SCRIPT_DIR, "models", "shemagh_m640_best.pt")
+# F1 specialists (single-class, for right_place)
+F1_HEAD_WEIGHTS    = M("head_m640_best.pt")
+F1_SHEMAGH_WEIGHTS = M("shemagh_m640_best.pt")
 
-# mAP model (multi-class) — UPDATE THIS after running map_experiment.py
-MAP_WEIGHTS = os.path.join(SCRIPT_DIR, "models", "map_best.pt")
+# mAP specialists (multi-class, but we pick best per-class)
+MAP_HEAD_WEIGHTS   = M("map_head_s640_best.pt")    # s_640: head mAP=0.8652
+MAP_SHEM_WEIGHTS   = M("map_shem_m640_best.pt")    # m_640: shem mAP=0.6562
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Inference Settings
 # ══════════════════════════════════════════════════════════════════════════════
-# F1 inference
-F1_HEAD_IMGSZ = 640
-F1_SHEMAGH_IMGSZ = 640
+# F1 pipeline
+F1_IMGSZ = 640
 F1_CONF = 0.15
 OVERLAP_THRESHOLD = 0.10
 
-# mAP inference — postprocessing params
-MAP_IMGSZ = 960           # Must match training resolution
-MAP_CONF = 0.01           # Low conf to maximize recall (mAP cares about ranking)
-MAP_IOU_THRESH = 0.5      # NMS IoU threshold
-MAP_MAX_DET_PER_CLASS = 5  # Cap detections per class per image
-MAP_HEAD_CONF_MIN = 0.05   # Drop head boxes below this
-MAP_SHEM_CONF_MIN = 0.05   # Drop shemagh boxes below this
+# mAP pipeline — postprocessing
+MAP_IMGSZ = 640
+MAP_CONF = 0.01              # Low for max recall (mAP ranks by confidence)
+MAP_MAX_DET_PER_CLASS = 5    # Cap FPs
+MAP_HEAD_CONF_MIN = 0.05     # Floor for head boxes
+MAP_SHEM_CONF_MIN = 0.05     # Floor for shemagh boxes
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. Load Models
+# 1. Load All 4 Models
 # ══════════════════════════════════════════════════════════════════════════════
 print("\n" + "="*60)
-print("  LOADING MODELS")
+print("  LOADING 4 SPECIALIST MODELS")
 print("="*60)
 
-# F1 specialist models
-assert os.path.exists(HEAD_WEIGHTS), f"Head weights not found: {HEAD_WEIGHTS}"
-assert os.path.exists(SHEMAGH_WEIGHTS), f"Shemagh weights not found: {SHEMAGH_WEIGHTS}"
-model_head = YOLO(HEAD_WEIGHTS)
-model_shemagh = YOLO(SHEMAGH_WEIGHTS)
-print(f"  F1 head model:    {HEAD_WEIGHTS}")
-print(f"  F1 shemagh model: {SHEMAGH_WEIGHTS}")
+for label, path in [("F1 head", F1_HEAD_WEIGHTS), ("F1 shemagh", F1_SHEMAGH_WEIGHTS),
+                     ("mAP head", MAP_HEAD_WEIGHTS), ("mAP shemagh", MAP_SHEM_WEIGHTS)]:
+    assert os.path.exists(path), f"{label} weights not found: {path}"
+    print(f"  ✓ {label}: {os.path.basename(path)}")
 
-# mAP multi-class model
-use_map_model = os.path.exists(MAP_WEIGHTS)
-if use_map_model:
-    model_map = YOLO(MAP_WEIGHTS)
-    print(f"  mAP model:        {MAP_WEIGHTS}")
-else:
-    model_map = None
-    print(f"  ⚠ mAP model not found at {MAP_WEIGHTS}")
-    print(f"    Will use F1 specialist detections for prediction_string")
+f1_head    = YOLO(F1_HEAD_WEIGHTS)
+f1_shemagh = YOLO(F1_SHEMAGH_WEIGHTS)
+map_head   = YOLO(MAP_HEAD_WEIGHTS)
+map_shem   = YOLO(MAP_SHEM_WEIGHTS)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. Inference
 # ══════════════════════════════════════════════════════════════════════════════
 print("\n" + "="*60)
-print("  DUAL PIPELINE INFERENCE")
+print("  QUAD SPECIALIST INFERENCE")
 print("="*60)
 
 def get_overlap(box_a, box_b):
@@ -118,54 +112,6 @@ def get_overlap(box_a, box_b):
     if min_area <= 0: return 0
     return inter / min_area
 
-def postprocess_map_boxes(results, imgsz):
-    """Extract and postprocess boxes from mAP model.
-    - Separate by class
-    - Apply class-specific confidence threshold
-    - Cap at top-K per class (sorted by confidence)
-    Returns list of (class_id, conf, x, y, w, h) tuples.
-    """
-    heads = []
-    shemaghs = []
-    
-    for box in results.boxes:
-        cls = int(box.cls[0])
-        conf = float(box.conf[0])
-        x, y, w, h = box.xywhn[0].tolist()
-        
-        if cls == 0 and conf >= MAP_HEAD_CONF_MIN:
-            heads.append((conf, x, y, w, h))
-        elif cls == 1 and conf >= MAP_SHEM_CONF_MIN:
-            shemaghs.append((conf, x, y, w, h))
-    
-    # Sort by confidence descending, cap at top-K
-    heads.sort(reverse=True)
-    shemaghs.sort(reverse=True)
-    heads = heads[:MAP_MAX_DET_PER_CLASS]
-    shemaghs = shemaghs[:MAP_MAX_DET_PER_CLASS]
-    
-    # Convert to output format
-    boxes = []
-    for conf, x, y, w, h in heads:
-        boxes.append((0, conf, x, y, w, h))
-    for conf, x, y, w, h in shemaghs:
-        boxes.append((1, conf, x, y, w, h))
-    
-    return boxes
-
-def specialist_boxes(res_h, res_s):
-    """Extract boxes from F1 specialist models (fallback for mAP)."""
-    boxes = []
-    for box in res_h.boxes:
-        conf = float(box.conf[0])
-        x, y, w, h = box.xywhn[0].tolist()
-        boxes.append((0, conf, x, y, w, h))
-    for box in res_s.boxes:
-        conf = float(box.conf[0])
-        x, y, w, h = box.xywhn[0].tolist()
-        boxes.append((1, conf, x, y, w, h))
-    return boxes
-
 test_dir = f"{ROOT_DIR}/images/test"
 test_files = sorted(os.listdir(test_dir))
 submission = []
@@ -179,36 +125,57 @@ for fname in test_files:
         print(f"Processing {count}/{total}...")
     count += 1
     
-    # ── F1 PIPELINE (specialist models → right_place) ──
-    res_h = model_head.predict(img_path, conf=F1_CONF, imgsz=F1_HEAD_IMGSZ, augment=True, verbose=False)[0]
-    heads_f1 = [box.xywhn[0].tolist() + [float(box.conf[0])] for box in res_h.boxes]
+    # ────────────────────────────────────────────────────────
+    # F1 PIPELINE → right_place
+    # ────────────────────────────────────────────────────────
+    res_fh = f1_head.predict(img_path, conf=F1_CONF, imgsz=F1_IMGSZ, augment=True, verbose=False)[0]
+    heads_f1 = [box.xywhn[0].tolist() for box in res_fh.boxes]
     
-    res_s = model_shemagh.predict(img_path, conf=F1_CONF, imgsz=F1_SHEMAGH_IMGSZ, augment=True, verbose=False)[0]
-    shemaghs_f1 = [box.xywhn[0].tolist() + [float(box.conf[0])] for box in res_s.boxes]
+    res_fs = f1_shemagh.predict(img_path, conf=F1_CONF, imgsz=F1_IMGSZ, augment=True, verbose=False)[0]
+    shemaghs_f1 = [box.xywhn[0].tolist() for box in res_fs.boxes]
     
-    # All-pairs overlap check
     rp = 0
     if heads_f1 and shemaghs_f1:
         for h in heads_f1:
             for s in shemaghs_f1:
-                if get_overlap(h[:4], s[:4]) > OVERLAP_THRESHOLD:
+                if get_overlap(h, s) > OVERLAP_THRESHOLD:
                     rp = 1
                     break
             if rp: break
     
-    # ── mAP PIPELINE (multi-class model → prediction_string) ──
-    if use_map_model:
-        res_map = model_map.predict(img_path, conf=MAP_CONF, imgsz=MAP_IMGSZ, 
-                                     iou=MAP_IOU_THRESH, augment=True, verbose=False)[0]
-        boxes = postprocess_map_boxes(res_map, MAP_IMGSZ)
-    else:
-        # Fallback: use specialist detections
-        boxes = specialist_boxes(res_h, res_s)
+    # ────────────────────────────────────────────────────────
+    # mAP PIPELINE → prediction_string
+    # ────────────────────────────────────────────────────────
+    # Head boxes from s_640 model (class 0 only)
+    res_mh = map_head.predict(img_path, conf=MAP_CONF, imgsz=MAP_IMGSZ, augment=True, verbose=False)[0]
+    head_boxes = []
+    for box in res_mh.boxes:
+        cls = int(box.cls[0])
+        conf = float(box.conf[0])
+        if cls == 0 and conf >= MAP_HEAD_CONF_MIN:
+            x, y, w, h = box.xywhn[0].tolist()
+            head_boxes.append((conf, x, y, w, h))
+    head_boxes.sort(reverse=True)
+    head_boxes = head_boxes[:MAP_MAX_DET_PER_CLASS]
+    
+    # Shemagh boxes from m_640 model (class 1 only)
+    res_ms = map_shem.predict(img_path, conf=MAP_CONF, imgsz=MAP_IMGSZ, augment=True, verbose=False)[0]
+    shem_boxes = []
+    for box in res_ms.boxes:
+        cls = int(box.cls[0])
+        conf = float(box.conf[0])
+        if cls == 1 and conf >= MAP_SHEM_CONF_MIN:
+            x, y, w, h = box.xywhn[0].tolist()
+            shem_boxes.append((conf, x, y, w, h))
+    shem_boxes.sort(reverse=True)
+    shem_boxes = shem_boxes[:MAP_MAX_DET_PER_CLASS]
     
     # Build prediction string
     parts = []
-    for cls, conf, x, y, w, h in boxes:
-        parts.extend([str(cls), f"{conf:.4f}", f"{x:.4f}", f"{y:.4f}", f"{w:.4f}", f"{h:.4f}"])
+    for conf, x, y, w, h in head_boxes:
+        parts.extend(["0", f"{conf:.4f}", f"{x:.4f}", f"{y:.4f}", f"{w:.4f}", f"{h:.4f}"])
+    for conf, x, y, w, h in shem_boxes:
+        parts.extend(["1", f"{conf:.4f}", f"{x:.4f}", f"{y:.4f}", f"{w:.4f}", f"{h:.4f}"])
     
     pred_str = " ".join(parts) if parts else "-"
     submission.append([fname, rp, pred_str])
