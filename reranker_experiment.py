@@ -65,6 +65,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--c", type=float, default=2.0)
     parser.add_argument("--max-iter", type=int, default=3000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--blend-alpha", type=float, default=None, help="Final score = alpha*confidence + (1-alpha)*rerank_raw")
+    parser.add_argument("--auto-blend", action=argparse.BooleanOptionalAction, default=True, help="Auto-select alpha on OOF to avoid degrading AP")
     parser.add_argument("--score-csv", type=str, default=None)
     parser.add_argument("--score-out-csv", type=str, default=None)
     return parser.parse_args()
@@ -81,7 +83,12 @@ def best_f1(y_true: np.ndarray, y_score: np.ndarray) -> dict[str, float]:
         return {"f1": float("nan"), "threshold": float("nan"), "precision": float("nan"), "recall": float("nan")}
     precision, recall, thresholds = precision_recall_curve(y_true, y_score)
     denom = precision + recall
-    f1 = np.where(denom > 0, 2.0 * precision * recall / denom, 0.0)
+    f1 = np.divide(
+        2.0 * precision * recall,
+        denom,
+        out=np.zeros_like(denom),
+        where=denom > 0,
+    )
     best_idx = int(np.argmax(f1))
     threshold = float(thresholds[best_idx]) if best_idx < len(thresholds) else 1.0
     return {
@@ -287,10 +294,12 @@ def score_external_csv(
     model: Pipeline,
     source_csv: Path,
     out_csv: Path,
+    blend_alpha: float,
 ) -> None:
     df = pd.read_csv(source_csv)
     df = ensure_features(df)
-    df["rerank_score"] = model.predict_proba(df[NUMERIC_FEATURES + CATEGORICAL_FEATURES])[:, 1]
+    df["rerank_score_raw"] = model.predict_proba(df[NUMERIC_FEATURES + CATEGORICAL_FEATURES])[:, 1]
+    df["rerank_score"] = blend_alpha * df["confidence"] + (1.0 - blend_alpha) * df["rerank_score_raw"]
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False)
 
@@ -340,8 +349,31 @@ def main() -> None:
     )
 
     confidence_fallback = to_numeric(df["confidence"], default=0.0).to_numpy()
-    oof_scores = np.where(np.isnan(oof_scores), confidence_fallback, oof_scores)
-    df["rerank_score"] = oof_scores
+    rerank_raw = np.where(np.isnan(oof_scores), confidence_fallback, oof_scores)
+    df["rerank_score_raw"] = rerank_raw
+
+    y_true = to_numeric(df[args.target_col], default=0).astype(int).to_numpy()
+    ap_base = safe_ap(y_true, confidence_fallback)
+    ap_raw = safe_ap(y_true, rerank_raw)
+
+    if args.blend_alpha is not None:
+        blend_alpha = float(np.clip(args.blend_alpha, 0.0, 1.0))
+    elif args.auto_blend:
+        best_alpha = 1.0
+        best_ap = ap_base
+        for alpha in np.linspace(0.0, 1.0, 101):
+            blended = alpha * confidence_fallback + (1.0 - alpha) * rerank_raw
+            ap = safe_ap(y_true, blended)
+            if np.isnan(ap):
+                continue
+            if ap > best_ap:
+                best_ap = ap
+                best_alpha = float(alpha)
+        blend_alpha = float(best_alpha)
+    else:
+        blend_alpha = 0.0
+
+    df["rerank_score"] = blend_alpha * confidence_fallback + (1.0 - blend_alpha) * rerank_raw
 
     metrics = evaluate_scores(df=df, target_col=args.target_col, base_col="confidence", rerank_col="rerank_score")
     metrics["settings"] = {
@@ -354,6 +386,10 @@ def main() -> None:
         "c": float(args.c),
         "max_iter": int(args.max_iter),
         "seed": int(args.seed),
+        "ap_base": ap_base,
+        "ap_rerank_raw": ap_raw,
+        "blend_alpha_selected": blend_alpha,
+        "auto_blend": bool(args.auto_blend),
     }
 
     final_model = make_pipeline(c_value=args.c, max_iter=args.max_iter, seed=args.seed)
@@ -375,16 +411,18 @@ def main() -> None:
     print(f"Saved metrics json: {metrics_path}")
 
     overall = metrics["overall"]
-    ap_base = overall["ap_base"]
+    ap_base_final = overall["ap_base"]
     ap_rerank = overall["ap_rerank"]
-    print(f"Overall AP base={ap_base:.6f} rerank={ap_rerank:.6f} delta={(ap_rerank - ap_base):.6f}")
+    print(f"Blend alpha selected={blend_alpha:.3f}")
+    print(f"Overall AP base={ap_base_final:.6f} rerank={ap_rerank:.6f} delta={(ap_rerank - ap_base_final):.6f}")
+    print(f"Raw rerank AP (before blend)={ap_raw:.6f}")
 
     if args.score_csv:
         score_source = Path(args.score_csv)
         score_dest = Path(args.score_out_csv) if args.score_out_csv else out_dir / "reranker_scored_external.csv"
         if not score_source.exists():
             raise FileNotFoundError(f"--score-csv not found: {score_source}")
-        score_external_csv(final_model, source_csv=score_source, out_csv=score_dest)
+        score_external_csv(final_model, source_csv=score_source, out_csv=score_dest, blend_alpha=blend_alpha)
         print(f"Saved scored external CSV: {score_dest}")
 
 
